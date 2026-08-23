@@ -294,6 +294,10 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // set when slot state was restored from a full-state session file at startup,
+    // skips prompt cache validation until the first matching prompt arrives
+    bool kv_restored = false;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -404,6 +408,8 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+
+        kv_restored = false;
     }
 
     void init_sampler() const {
@@ -1313,6 +1319,115 @@ private:
             slot.reset();
         }
 
+        // load full session state if present in --slot-save-path (KV persistence across restarts)
+        if (!params_base.slot_save_path.empty()) {
+            std::string session_path = params_base.slot_save_path + "_startup_session.bin";
+            if (std::filesystem::exists(session_path)) {
+                SRV_INF("loading full session state from %s\n", session_path.c_str());
+                size_t n_session_tokens = 0;
+                if (llama_state_load_file(ctx_tgt, session_path.c_str(), nullptr, 0, &n_session_tokens)) {
+                    SRV_INF("%s", "session state loaded successfully\n");
+                    for (auto & slot : slots) {
+                        bool slot_loaded = false;
+                        std::string slot_path = params_base.slot_save_path + "slot_" + std::to_string(slot.id) + ".tok";
+                        if (std::filesystem::exists(slot_path)) {
+                            std::ifstream f(slot_path, std::ios::binary);
+                            uint32_t magic = 0, version = 0;
+                            f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+                            f.read(reinterpret_cast<char*>(&version), sizeof(version));
+                            if (!f.good() || magic != 0x544F4B31 || version != 1) {
+                                SRV_WRN("slot %d: invalid or outdated .tok format, skipping\n", slot.id);
+                            } else {
+                                uint32_t n_tok = 0;
+                                f.read(reinterpret_cast<char*>(&n_tok), sizeof(n_tok));
+                                if (!f.good() || n_tok == 0 || n_tok > 10*1024*1024) {
+                                    SRV_WRN("slot %d: invalid token count (%u), skipping\n", slot.id, n_tok);
+                                } else {
+                                    llama_tokens tokens(n_tok);
+                                    f.read(reinterpret_cast<char*>(tokens.data()), n_tok * sizeof(llama_token));
+                                    if (!f.good()) {
+                                        SRV_WRN("slot %d: truncated .tok file, skipping\n", slot.id);
+                                    } else {
+                                        slot.prompt.tokens.clear();
+                                        slot.prompt.tokens.insert(tokens);
+                                        slot.kv_restored = true;
+                                        slot_loaded = true;
+                                        SRV_INF("slot %d: restored %u tokens\n", slot.id, n_tok);
+                                    }
+                                }
+                            }
+                        }
+
+                        // load checkpoints if available
+                        std::string ckpt_path = params_base.slot_save_path + "slot_" + std::to_string(slot.id) + ".ckpt";
+                        if (std::filesystem::exists(ckpt_path) && slot_loaded) {
+                            std::ifstream f(ckpt_path, std::ios::binary);
+                            uint32_t magic = 0, version = 0;
+                            f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+                            f.read(reinterpret_cast<char*>(&version), sizeof(version));
+                            if (!f.good() || magic != 0x434B5054 || version != 1) {
+                                SRV_WRN("slot %d: invalid or outdated .ckpt format, skipping\n", slot.id);
+                            } else {
+                                uint32_t n_ckpts = 0;
+                                f.read(reinterpret_cast<char*>(&n_ckpts), sizeof(n_ckpts));
+                                if (!f.good() || n_ckpts > 1000) {
+                                    SRV_WRN("slot %d: invalid checkpoint count (%u), skipping\n", slot.id, n_ckpts);
+                                } else {
+                                    size_t total_ckpt_bytes = 0;
+                                    bool ckpt_ok = true;
+                                    for (uint32_t i = 0; i < n_ckpts && ckpt_ok; ++i) {
+                                        auto & ckpt = slot.prompt.checkpoints.emplace_back();
+
+                                        f.read(reinterpret_cast<char*>(&ckpt.n_tokens), sizeof(ckpt.n_tokens));
+                                        f.read(reinterpret_cast<char*>(&ckpt.pos_min),  sizeof(ckpt.pos_min));
+                                        f.read(reinterpret_cast<char*>(&ckpt.pos_max),  sizeof(ckpt.pos_max));
+                                        if (!f.good()) { ckpt_ok = false; break; }
+
+                                        uint64_t sz;
+                                        f.read(reinterpret_cast<char*>(&sz), sizeof(sz));
+                                        if (!f.good() || sz > 10ull*1024*1024*1024) { ckpt_ok = false; break; }
+                                        ckpt.data_tgt.resize(sz);
+                                        f.read(reinterpret_cast<char*>(ckpt.data_tgt.data()), sz);
+                                        total_ckpt_bytes += sz;
+                                        if (!f.good()) { ckpt_ok = false; break; }
+
+                                        f.read(reinterpret_cast<char*>(&sz), sizeof(sz));
+                                        if (!f.good() || sz > 10ull*1024*1024*1024) { ckpt_ok = false; break; }
+                                        ckpt.data_dft.resize(sz);
+                                        f.read(reinterpret_cast<char*>(ckpt.data_dft.data()), sz);
+                                        total_ckpt_bytes += sz;
+                                        if (!f.good()) { ckpt_ok = false; break; }
+
+                                        f.read(reinterpret_cast<char*>(&sz), sizeof(sz));
+                                        if (!f.good() || sz > 10ull*1024*1024*1024) { ckpt_ok = false; break; }
+                                        ckpt.data_spec.resize(sz);
+                                        f.read(reinterpret_cast<char*>(ckpt.data_spec.data()), sz);
+                                        total_ckpt_bytes += sz;
+                                        if (!f.good()) { ckpt_ok = false; break; }
+                                    }
+                                    if (!ckpt_ok) {
+                                        SRV_WRN("slot %d: truncated .ckpt file, discarding %zu checkpoints\n",
+                                                slot.id, slot.prompt.checkpoints.size());
+                                        slot.prompt.checkpoints.clear();
+                                    } else {
+                                        SRV_INF("slot %d: restored %u checkpoints (%.1f MiB)\n",
+                                                slot.id, n_ckpts, (float) total_ckpt_bytes / 1024 / 1024);
+                                    }
+                                }
+                            }
+                        }
+
+                        // clear orphaned KV cells for slots without restored tokens
+                        if (!slot_loaded) {
+                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, 0, -1);
+                        }
+                    }
+                } else {
+                    SRV_WRN("failed to load session state from %s\n", session_path.c_str());
+                }
+            }
+        }
+
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
@@ -1638,6 +1753,9 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+            // restored slots already hold exact KV state, prompt cache round-trip would corrupt it
+            update_cache = update_cache && !ret->kv_restored;
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -2683,6 +2801,86 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SAVE_SESSION:
+                {
+                    // full-state save touches the shared memory module, all slots must be idle
+                    bool any_processing = false;
+                    for (const auto & slot : slots) {
+                        any_processing |= slot.is_processing();
+                    }
+                    if (any_processing) {
+                        SRV_DBG("slots busy, defer save-session task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    std::string filename = task.slot_action.filename;
+                    std::string filepath = task.slot_action.filepath;
+
+                    if (!llama_state_save_file(ctx_tgt, filepath.c_str(), nullptr, 0)) {
+                        send_error(task, "Failed to save session state", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    size_t n_tokens_total = 0;
+                    for (const auto & slot : slots) {
+                        if (slot.prompt.n_tokens() > 0 && !slot.prompt.tokens.has_mtmd) {
+                            std::string tok_path = params_base.slot_save_path + "slot_" + std::to_string(slot.id) + ".tok";
+                            std::ofstream f(tok_path, std::ios::binary);
+                            const uint32_t magic   = 0x544F4B31;
+                            const uint32_t version = 1;
+                            f.write(reinterpret_cast<const char*>(&magic),   sizeof(magic));
+                            f.write(reinterpret_cast<const char*>(&version), sizeof(version));
+                            uint32_t n_tokens = (uint32_t) slot.prompt.tokens.size();
+                            f.write(reinterpret_cast<const char*>(&n_tokens), sizeof(n_tokens));
+                            auto raw_tokens = slot.prompt.tokens.get_tokens();
+                            f.write(reinterpret_cast<const char*>(raw_tokens.data()), n_tokens * sizeof(llama_token));
+                            n_tokens_total += n_tokens;
+                        }
+
+                        if (!slot.prompt.checkpoints.empty()) {
+                            std::string ckpt_path = params_base.slot_save_path + "slot_" + std::to_string(slot.id) + ".ckpt";
+                            std::ofstream f(ckpt_path, std::ios::binary);
+                            const uint32_t magic   = 0x434B5054;
+                            const uint32_t version = 1;
+                            f.write(reinterpret_cast<const char*>(&magic),   sizeof(magic));
+                            f.write(reinterpret_cast<const char*>(&version), sizeof(version));
+                            uint32_t n_ckpts = (uint32_t) slot.prompt.checkpoints.size();
+                            f.write(reinterpret_cast<const char*>(&n_ckpts), sizeof(n_ckpts));
+                            for (const auto & ckpt : slot.prompt.checkpoints) {
+                                f.write(reinterpret_cast<const char*>(&ckpt.n_tokens), sizeof(ckpt.n_tokens));
+                                f.write(reinterpret_cast<const char*>(&ckpt.pos_min),  sizeof(ckpt.pos_min));
+                                f.write(reinterpret_cast<const char*>(&ckpt.pos_max),  sizeof(ckpt.pos_max));
+
+                                uint64_t sz = ckpt.data_tgt.size();
+                                f.write(reinterpret_cast<const char*>(&sz), sizeof(sz));
+                                f.write(reinterpret_cast<const char*>(ckpt.data_tgt.data()), sz);
+
+                                sz = ckpt.data_dft.size();
+                                f.write(reinterpret_cast<const char*>(&sz), sizeof(sz));
+                                f.write(reinterpret_cast<const char*>(ckpt.data_dft.data()), sz);
+
+                                sz = ckpt.data_spec.size();
+                                f.write(reinterpret_cast<const char*>(&sz), sizeof(sz));
+                                f.write(reinterpret_cast<const char*>(ckpt.data_spec.data()), sz);
+                            }
+                        }
+                    }
+
+                    const int64_t t_end = ggml_time_us();
+
+                    auto res = std::make_unique<server_task_result_slot_save_load>();
+                    res->id       = task.id;
+                    res->id_slot  = -1;
+                    res->filename = filename;
+                    res->is_save  = true;
+                    res->n_tokens = n_tokens_total;
+                    res->n_bytes  = std::filesystem::file_size(filepath);
+                    res->t_ms     = (t_end - t_start) / 1000.0;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -3346,7 +3544,9 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // also step back to a checkpoint when a restored session has tokenization mismatch
+                                const bool kv_restored_mismatch = slot.kv_restored && n_past < (int) slot.prompt.n_tokens();
+                                if (pos_min >= pos_min_thold || kv_restored_mismatch) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3412,6 +3612,7 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+                        slot.kv_restored = false;
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -3441,7 +3642,14 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    // do not abort on failure: hybrid/RS memory is immutable past population,
+                    // stale cells are either absent (exact tokenization match) or harmless
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
+                        SLT_WRN(slot, "seq_rm [%d, end) failed (hybrid/RS memory may be immutable past population)\n", p0);
+                    }
+                    if (ctx_dft) {
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, p0, -1);
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -4801,6 +5009,15 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->post_save_session = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support session save. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        return handle_save_session(req);
+    };
+
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
@@ -5286,6 +5503,44 @@ void server_routes::init_routes() {
         return res;
     };
 }
+
+std::unique_ptr<server_res_generator> server_routes::handle_save_session(const server_http_req & req) {
+    auto res = create_response();
+    const json request_data = json::parse(req.body);
+    std::string filename = request_data.at("filename");
+    if (!fs_validate_filename(filename)) {
+        res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    std::string filepath = params.slot_save_path + filename;
+
+    // executed on the server thread (task queue), serialized against decoding
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SAVE_SESSION);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot  = -1;
+        task.slot_action.filename = filename;
+        task.slot_action.filepath = filepath;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    res->ok(result->to_json());
+    return res;
+}
+
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
     auto res = create_response();
