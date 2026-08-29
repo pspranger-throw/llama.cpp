@@ -138,6 +138,13 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph);
+
+        // (optional) op-offload weight prefetch: stage a full host tensor into a reusable device
+        // ring on a transfer stream (offload_prefetch), then copy it into the destination tensor
+        // on the compute stream (offload_commit). offload_commit returns false if the tensor was
+        // not prefetched, in which case the caller must use the regular copy path.
+        bool (*offload_prefetch) (ggml_backend_t backend, struct ggml_tensor * dst, const void * src_host);
+        bool (*offload_commit)   (ggml_backend_t backend, struct ggml_tensor * dst);
     };
 
     struct ggml_backend {

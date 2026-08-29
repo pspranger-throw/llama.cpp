@@ -1483,6 +1483,21 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
 
+    struct {
+        char * dev_mem = nullptr;
+        size_t total_bytes = 0;
+        size_t slot_bytes = 0;
+        int n_slots = 2;
+        size_t chunk_bytes = size_t(8) << 20;
+        cudaStream_t dma_stream = nullptr;
+        struct slot_state {
+            cudaEvent_t free_event = nullptr;
+            std::vector<cudaEvent_t> chunk_events;
+        };
+        std::vector<slot_state> slots;
+        std::unordered_map<const void *, int> pending;
+    } offload_prefetch;
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

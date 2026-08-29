@@ -1603,6 +1603,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    const bool op_offload_prefetch = !sched->callback_eval && getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH") != nullptr;
+    const bool op_offload_prefetch_dbg = op_offload_prefetch && getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG") != nullptr;
+    if (op_offload_prefetch_dbg) {
+        int mmid_b[3] = {0, 0, 0};
+        for (int i = 0; i < sched->n_splits; i++) {
+            struct ggml_backend_sched_split * s = &splits[i];
+            if (s->graph.n_nodes > 0 && s->graph.nodes[0]->op == GGML_OP_MUL_MAT_ID && s->backend_id < 3) {
+                mmid_b[s->backend_id]++;
+            }
+        }
+        fprintf(stderr, "PREFETCHDBG: pass n_splits=%d mmid_splits b0=%d b1=%d b2=%d\n",
+                sched->n_splits, mmid_b[0], mmid_b[1], mmid_b[2]);
+    }
+    const bool op_offload_prefetch_eager = op_offload_prefetch && getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_EAGER") != nullptr;
+    std::vector<const ggml_tensor *> prefetch_issued;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1623,6 +1639,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            if (op_offload_prefetch && split_backend->iface.offload_commit != NULL) {
+                if (split_backend->iface.offload_commit(split_backend, input_cpy)) {
+                    // this tensor was prefetched into the device ring by an earlier split's
+                    // offload_prefetch call; the ring -> tensor copy is already enqueued on
+                    // the compute stream ahead of this split's graph
+                    continue;
+                }
+                if (op_offload_prefetch_eager && split_backend->iface.offload_prefetch != NULL &&
+                    split_backend->iface.offload_prefetch(split_backend, input_cpy, input->data) &&
+                    split_backend->iface.offload_commit(split_backend, input_cpy)) {
+                    // eager mode: exercise the ring path without cross-split lookahead
+                    continue;
+                }
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1745,6 +1776,74 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (op_offload_prefetch && split_backend->iface.offload_prefetch != NULL) {
+                // issue the expert-weight transfer for the next split on this backend that
+                // consumes op-offloaded weights, so the H2D copy runs on the transfer stream
+                // while this split's graph computes
+                for (int j = split_id + 1; j < sched->n_splits; j++) {
+                    struct ggml_backend_sched_split * ns = &splits[j];
+                    if (getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG")) {
+                        static int scans = 0;
+                        if (scans < 48 && ns->graph.n_nodes > 0) {
+                            fprintf(stderr, "PREFETCHDBG: scan from split %d -> j=%d backend %d node0=%s n_inputs=%d\n",
+                                    split_id, j, ns->backend_id, ggml_op_name(ns->graph.nodes[0]->op), ns->n_inputs);
+                            scans++;
+                        }
+                    }
+                    if (ns->backend_id != split_backend_id || ns->graph.n_nodes == 0) {
+                        continue;
+                    }
+                    struct ggml_tensor * nnode = ns->graph.nodes[0];
+                    if (nnode->op != GGML_OP_MUL_MAT_ID) {
+                        continue;
+                    }
+                    bool issued = false;
+                    for (int ii = 0; ii < ns->n_inputs; ii++) {
+                        struct ggml_tensor * ninp = ns->inputs[ii];
+                        if (getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG") && sched->n_splits > 80) {
+                            static int ichk = 0;
+                            if (ichk < 20) {
+                                ichk++;
+                                fprintf(stderr, "PREFETCHDBG: input chk j=%d in[%d] %-28s buf=%p usage=%d host=%d\n",
+                                        j, ii, ninp->name, (void*)ninp->buffer,
+                                        ninp->buffer ? (int)ggml_backend_buffer_get_usage(ninp->buffer) : -1,
+                                        ninp->buffer ? (int)ggml_backend_buffer_is_host(ninp->buffer) : -1);
+                            }
+                        }
+                        if (ninp->buffer == NULL ||
+                            ggml_backend_buffer_get_usage(ninp->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                            !ggml_backend_buffer_is_host(ninp->buffer)) {
+                            continue;
+                        }
+                        struct ggml_tensor * ncpy = tensor_copy(ninp, ns->backend_id, sched->cur_copy);
+                        bool already_issued = false;
+                        for (auto t : prefetch_issued) {
+                            if (t == ncpy) { already_issued = true; break; }
+                        }
+                        if (getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG") && sched->n_splits > 80) {
+                            static int mchk = 0;
+                            if (mchk < 20) {
+                                mchk++;
+                                fprintf(stderr, "PREFETCHDBG: weight cand j=%d %-28s ncpy=%p node0.src0=%p match=%d already=%d\n",
+                                        j, ninp->name, (void*)ncpy, (void*)nnode->src[0], (int)(nnode->src[0] == ncpy), (int)already_issued);
+                            }
+                        }
+                        if (!already_issued &&
+                            nnode->src[0] == ncpy &&
+                            split_backend->iface.offload_prefetch(split_backend, ncpy, ninp->data)) {
+                            prefetch_issued.push_back(ncpy);
+                            issued = true;
+                        }
+                    }
+                    if (issued) {
+                        break;
+                    }
+                }
+                if (getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG")) {
+                    static int attempts = 0;
+                    fprintf(stderr, "PREFETCHDBG: split %d backend %d: issue attempt done (%d total)\n", split_id, split_backend_id, ++attempts);
+                }
             }
         } else {
             // similar to ggml_backend_compare_graph_backend

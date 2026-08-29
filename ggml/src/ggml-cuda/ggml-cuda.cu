@@ -707,6 +707,23 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (offload_prefetch.dev_mem != nullptr) {
+        if (offload_prefetch.dma_stream != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(offload_prefetch.dma_stream));
+            CUDA_CHECK(cudaStreamDestroy(offload_prefetch.dma_stream));
+        }
+        for (auto & s : offload_prefetch.slots) {
+            if (s.free_event != nullptr) {
+                CUDA_CHECK(cudaEventDestroy(s.free_event));
+            }
+            for (auto & e : s.chunk_events) {
+                if (e != nullptr) {
+                    CUDA_CHECK(cudaEventDestroy(e));
+                }
+            }
+        }
+        CUDA_CHECK(cudaFree(offload_prefetch.dev_mem));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2439,6 +2456,130 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+}
+
+static size_t ggml_cuda_offload_prefetch_ring_size() {
+    const char * env = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_RING_MB");
+    const long long mb = env ? atoll(env) : 2048;
+    return mb > 0 ? (size_t)mb << 20 : 0;
+}
+
+static bool ggml_backend_cuda_offload_prefetch(ggml_backend_t backend, ggml_tensor * tensor, const void * data) {
+    static const bool enabled = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH") != nullptr;
+    static const bool dbg = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG") != nullptr;
+    if (!enabled) {
+        return false;
+    }
+    if (dbg) {
+        static int calls = 0;
+        static size_t total = 0;
+        calls++;
+        total += ggml_nbytes(tensor);
+        fprintf(stderr, "PREFETCHDBG: cuda prefetch #%d %s (%zu MiB, lifetime %zu MiB)\n", calls, tensor->name, ggml_nbytes(tensor) >> 20, total >> 20);
+    }
+    if (dbg) fprintf(stderr, "PREFETCHDBG: cuda prefetch called for %s (%zu MiB)\n", tensor->name, ggml_nbytes(tensor) >> 20);
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    auto & ring = cuda_ctx->offload_prefetch;
+
+    if (ring.pending.find(tensor) != ring.pending.end()) {
+        return true;
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    const size_t nbytes = ggml_nbytes(tensor);
+
+    if (ring.dev_mem == nullptr) {
+        const size_t total = ggml_cuda_offload_prefetch_ring_size();
+        if (total == 0) {
+            return false;
+        }
+        ggml_cuda_set_device(cuda_ctx->device);
+        if (cudaMalloc(&ring.dev_mem, total) != cudaSuccess) {
+            cudaGetLastError();
+            GGML_LOG_WARN("%s: op-offload prefetch ring allocation of %zu MiB failed - prefetch disabled\n", __func__, total >> 20);
+            return false;
+        }
+        ring.total_bytes = total;
+        ring.slot_bytes = total / ring.n_slots;
+        ring.slots.resize(ring.n_slots);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ring.dma_stream, cudaStreamNonBlocking));
+        GGML_LOG_INFO("%s: op-offload prefetch ring allocated: %zu MiB total, %d slots x %zu MiB, chunk %zu MiB\n",
+                      __func__, total >> 20, ring.n_slots, ring.slot_bytes >> 20, ring.chunk_bytes >> 20);
+    }
+
+    if (nbytes > ring.slot_bytes) {
+        return false;
+    }
+
+    int slot_idx = -1;
+    for (int i = 0; i < ring.n_slots; i++) {
+        auto & s = ring.slots[i];
+        if (s.free_event == nullptr || cudaEventQuery(s.free_event) == cudaSuccess) {
+            slot_idx = i;
+            break;
+        }
+    }
+    if (slot_idx < 0) {
+        return false;
+    }
+
+    auto & S = ring.slots[slot_idx];
+    if (S.free_event != nullptr) {
+        CUDA_CHECK(cudaStreamWaitEvent(ring.dma_stream, S.free_event, 0));
+    }
+
+    const int n_chunks = (int)((nbytes + ring.chunk_bytes - 1) / ring.chunk_bytes);
+    S.chunk_events.resize(n_chunks);
+    for (int k = 0; k < n_chunks; k++) {
+        if (S.chunk_events[k] == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&S.chunk_events[k], cudaEventDisableTiming));
+        }
+        const size_t off = (size_t)k * ring.chunk_bytes;
+        const size_t len = std::min(ring.chunk_bytes, nbytes - off);
+        char * dst = ring.dev_mem + (size_t)slot_idx * ring.slot_bytes + off;
+        CUDA_CHECK(cudaMemcpyAsync(dst, (const char *)data + off, len, cudaMemcpyHostToDevice, ring.dma_stream));
+        CUDA_CHECK(cudaEventRecord(S.chunk_events[k], ring.dma_stream));
+    }
+
+    ring.pending[tensor] = slot_idx;
+    return true;
+}
+
+static bool ggml_backend_cuda_offload_commit(ggml_backend_t backend, ggml_tensor * tensor) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    auto & ring = cuda_ctx->offload_prefetch;
+
+    if (ring.dev_mem == nullptr) {
+        return false;
+    }
+
+    auto it = ring.pending.find(tensor);
+    if (it == ring.pending.end()) {
+        return false;
+    }
+    const int slot_idx = it->second;
+    ring.pending.erase(it);
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    cudaStream_t cs = cuda_ctx->stream();
+    auto & S = ring.slots[slot_idx];
+    const size_t nbytes = ggml_nbytes(tensor);
+    const int n_chunks = (int)S.chunk_events.size();
+    for (int k = 0; k < n_chunks; k++) {
+        const size_t off = (size_t)k * ring.chunk_bytes;
+        const size_t len = std::min(ring.chunk_bytes, nbytes - off);
+        CUDA_CHECK(cudaStreamWaitEvent(cs, S.chunk_events[k], 0));
+        const char * src = ring.dev_mem + (size_t)slot_idx * ring.slot_bytes + off;
+        CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + off, src, len, cudaMemcpyDeviceToDevice, cs));
+    }
+    if (S.free_event == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&S.free_event, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(S.free_event, cs));
+    return true;
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -4589,6 +4730,8 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .offload_prefetch        = */ ggml_backend_cuda_offload_prefetch,
+    /* .offload_commit          = */ ggml_backend_cuda_offload_commit,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
