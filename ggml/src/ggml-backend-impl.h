@@ -145,6 +145,13 @@ extern "C" {
         // not prefetched, in which case the caller must use the regular copy path.
         bool (*offload_prefetch) (ggml_backend_t backend, struct ggml_tensor * dst, const void * src_host);
         bool (*offload_commit)   (ggml_backend_t backend, struct ggml_tensor * dst);
+
+        // (optional) op-offload used-expert transfer on a DMA stream: offload_readback copies a
+        // device tensor to the host through pinned memory, blocking only until the readback
+        // completes; offload_dma_copy stages a host range into the tensor on the DMA stream,
+        // ordering the compute stream after it. Both return false if unsupported.
+        bool (*offload_dma_copy) (ggml_backend_t backend, struct ggml_tensor * dst, const void * src_host, size_t offset, size_t size);
+        bool (*offload_readback) (ggml_backend_t backend, const struct ggml_tensor * src, void * dst_host, size_t offset, size_t size);
     };
 
     struct ggml_backend {

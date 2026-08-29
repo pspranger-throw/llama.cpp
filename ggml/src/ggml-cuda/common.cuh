@@ -1496,6 +1496,12 @@ struct ggml_backend_cuda_context {
         };
         std::vector<slot_state> slots;
         std::unordered_map<const void *, int> pending;
+        // filter+dma mode: no ring, the DMA stream carries used-expert range copies
+        cudaEvent_t dma_bridge_event = nullptr;
+        cudaEvent_t dma_done_event = nullptr;
+        cudaEvent_t readback_event = nullptr;
+        void * readback_pinned = nullptr;
+        size_t readback_pinned_size = 0;
     } offload_prefetch;
 
     ~ggml_backend_cuda_context();

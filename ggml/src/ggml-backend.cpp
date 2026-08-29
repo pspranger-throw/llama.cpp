@@ -1603,8 +1603,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
-    const bool op_offload_prefetch = !sched->callback_eval && getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH") != nullptr;
-    const bool op_offload_prefetch_dbg = op_offload_prefetch && getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG") != nullptr;
+    const char * op_offload_env = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH");
+    const int op_offload_mode = op_offload_env ? atoi(op_offload_env) : 0;
+    // mode 1: ring lookahead prefetch (v0.1), mode 2: used-expert filter + DMA stream (v0.2)
+    const bool op_offload_prefetch = !sched->callback_eval && op_offload_mode == 1;
+    const bool op_offload_dma = !sched->callback_eval && op_offload_mode == 2;
+    const bool op_offload_prefetch_dbg = (op_offload_prefetch || op_offload_dma) && getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG") != nullptr;
     if (op_offload_prefetch_dbg) {
         int mmid_b[3] = {0, 0, 0};
         for (int i = 0; i < sched->n_splits; i++) {
@@ -1701,8 +1705,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
-                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
+                        if (!(op_offload_dma && ids_backend->iface.offload_readback != NULL &&
+                              ids_backend->iface.offload_readback(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor)))) {
+                            ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                            ggml_backend_synchronize(ids_backend);
+                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -1725,12 +1732,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                        if (op_offload_dma && split_backend->iface.offload_dma_copy != NULL) {
+                            split_backend->iface.offload_dma_copy(split_backend, input_cpy,
+                                (const uint8_t *)input->data + expert_offset, expert_offset,
+                                expert_size_copy + padding_end);
+                        } else {
+                            ggml_backend_tensor_set_async(split_backend,
+                                input_cpy,
+                                (const uint8_t *)input->data + expert_offset, expert_offset,
+                                // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                                // this is necessary for MMQ in the CUDA backend
+                                expert_size_copy + padding_end);
+                        }
                     };
 
                     int id = 0;

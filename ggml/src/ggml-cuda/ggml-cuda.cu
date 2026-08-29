@@ -707,22 +707,34 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (offload_prefetch.dma_stream != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(offload_prefetch.dma_stream));
+        CUDA_CHECK(cudaStreamDestroy(offload_prefetch.dma_stream));
+    }
+    for (auto & s : offload_prefetch.slots) {
+        if (s.free_event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(s.free_event));
+        }
+        for (auto & e : s.chunk_events) {
+            if (e != nullptr) {
+                CUDA_CHECK(cudaEventDestroy(e));
+            }
+        }
+    }
     if (offload_prefetch.dev_mem != nullptr) {
-        if (offload_prefetch.dma_stream != nullptr) {
-            CUDA_CHECK(cudaStreamSynchronize(offload_prefetch.dma_stream));
-            CUDA_CHECK(cudaStreamDestroy(offload_prefetch.dma_stream));
-        }
-        for (auto & s : offload_prefetch.slots) {
-            if (s.free_event != nullptr) {
-                CUDA_CHECK(cudaEventDestroy(s.free_event));
-            }
-            for (auto & e : s.chunk_events) {
-                if (e != nullptr) {
-                    CUDA_CHECK(cudaEventDestroy(e));
-                }
-            }
-        }
         CUDA_CHECK(cudaFree(offload_prefetch.dev_mem));
+    }
+    if (offload_prefetch.dma_bridge_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(offload_prefetch.dma_bridge_event));
+    }
+    if (offload_prefetch.dma_done_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(offload_prefetch.dma_done_event));
+    }
+    if (offload_prefetch.readback_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(offload_prefetch.readback_event));
+    }
+    if (offload_prefetch.readback_pinned != nullptr) {
+        CUDA_CHECK(cudaFreeHost(offload_prefetch.readback_pinned));
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -2579,6 +2591,74 @@ static bool ggml_backend_cuda_offload_commit(ggml_backend_t backend, ggml_tensor
         CUDA_CHECK(cudaEventCreateWithFlags(&S.free_event, cudaEventDisableTiming));
     }
     CUDA_CHECK(cudaEventRecord(S.free_event, cs));
+    return true;
+}
+
+static bool ggml_backend_cuda_offload_dma_copy(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    auto & ring = cuda_ctx->offload_prefetch;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    if (ring.dma_stream == nullptr) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ring.dma_stream, cudaStreamNonBlocking));
+    }
+    if (ring.dma_bridge_event == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ring.dma_bridge_event, cudaEventDisableTiming));
+    }
+    if (ring.dma_done_event == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ring.dma_done_event, cudaEventDisableTiming));
+    }
+
+    cudaStream_t cs = cuda_ctx->stream();
+
+    // order the write after everything the compute stream waits on (input-copy buffer reuse)
+    CUDA_CHECK(cudaEventRecord(ring.dma_bridge_event, cs));
+    CUDA_CHECK(cudaStreamWaitEvent(ring.dma_stream, ring.dma_bridge_event, 0));
+
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, ring.dma_stream));
+
+    // order the split graph enqueued later on the compute stream after the copy
+    CUDA_CHECK(cudaEventRecord(ring.dma_done_event, ring.dma_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(cs, ring.dma_done_event, 0));
+
+    return true;
+}
+
+static bool ggml_backend_cuda_offload_readback(ggml_backend_t backend, const ggml_tensor * tensor, void * dst, size_t offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    auto & ring = cuda_ctx->offload_prefetch;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    if (ring.readback_pinned_size < size) {
+        if (ring.readback_pinned != nullptr) {
+            CUDA_CHECK(cudaFreeHost(ring.readback_pinned));
+        }
+        CUDA_CHECK(cudaHostAlloc(&ring.readback_pinned, size, cudaHostAllocDefault));
+        ring.readback_pinned_size = size;
+    }
+    if (ring.readback_event == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ring.readback_event, cudaEventDisableTiming));
+    }
+
+    cudaStream_t cs = cuda_ctx->stream();
+
+    // the host waits only for this readback (and the work it depends on), not for a full device drain
+    CUDA_CHECK(cudaMemcpyAsync(ring.readback_pinned, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cs));
+    CUDA_CHECK(cudaEventRecord(ring.readback_event, cs));
+    CUDA_CHECK(cudaEventSynchronize(ring.readback_event));
+
+    memcpy(dst, ring.readback_pinned, size);
+
     return true;
 }
 
@@ -4732,6 +4812,8 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
     /* .offload_prefetch        = */ ggml_backend_cuda_offload_prefetch,
     /* .offload_commit          = */ ggml_backend_cuda_offload_commit,
+    /* .offload_dma_copy        = */ ggml_backend_cuda_offload_dma_copy,
+    /* .offload_readback        = */ ggml_backend_cuda_offload_readback,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
