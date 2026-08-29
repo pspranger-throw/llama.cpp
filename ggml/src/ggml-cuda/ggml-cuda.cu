@@ -713,8 +713,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             offload_prefetch.stop_worker.store(true);
         }
         offload_prefetch.cv_work.notify_all();
-        if (offload_prefetch.worker.joinable()) {
-            offload_prefetch.worker.join();
+        for (auto & w : offload_prefetch.workers) {
+            if (w.joinable()) {
+                w.join();
+            }
         }
         CUDA_CHECK(cudaStreamSynchronize(offload_prefetch.dma_stream));
         CUDA_CHECK(cudaStreamDestroy(offload_prefetch.dma_stream));
@@ -732,17 +734,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (offload_prefetch.dev_mem != nullptr) {
         CUDA_CHECK(cudaFree(offload_prefetch.dev_mem));
     }
-    if (offload_prefetch.dma_bridge_event != nullptr) {
-        CUDA_CHECK(cudaEventDestroy(offload_prefetch.dma_bridge_event));
-    }
-    if (offload_prefetch.dma_done_event != nullptr) {
-        CUDA_CHECK(cudaEventDestroy(offload_prefetch.dma_done_event));
-    }
-    if (offload_prefetch.readback_event != nullptr) {
-        CUDA_CHECK(cudaEventDestroy(offload_prefetch.readback_event));
-    }
-    if (offload_prefetch.readback_pinned != nullptr) {
-        CUDA_CHECK(cudaFreeHost(offload_prefetch.readback_pinned));
+    if (offload_prefetch.pinned_mem != nullptr) {
+        CUDA_CHECK(cudaFreeHost(offload_prefetch.pinned_mem));
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -2484,89 +2477,6 @@ static size_t ggml_cuda_offload_prefetch_ring_size() {
     return mb > 0 ? (size_t)mb << 20 : 0;
 }
 
-static bool ggml_backend_cuda_offload_prefetch(ggml_backend_t backend, ggml_tensor * tensor, const void * data) {
-    static const bool enabled = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH") != nullptr;
-    static const bool dbg = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG") != nullptr;
-    if (!enabled) {
-        return false;
-    }
-    if (dbg) {
-        static int calls = 0;
-        static size_t total = 0;
-        calls++;
-        total += ggml_nbytes(tensor);
-        fprintf(stderr, "PREFETCHDBG: cuda prefetch #%d %s (%zu MiB, lifetime %zu MiB)\n", calls, tensor->name, ggml_nbytes(tensor) >> 20, total >> 20);
-    }
-    if (dbg) fprintf(stderr, "PREFETCHDBG: cuda prefetch called for %s (%zu MiB)\n", tensor->name, ggml_nbytes(tensor) >> 20);
-
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    auto & ring = cuda_ctx->offload_prefetch;
-
-    if (ring.pending.find(tensor) != ring.pending.end()) {
-        return true;
-    }
-
-    ggml_cuda_set_device(cuda_ctx->device);
-
-    const size_t nbytes = ggml_nbytes(tensor);
-
-    if (ring.dev_mem == nullptr) {
-        const size_t total = ggml_cuda_offload_prefetch_ring_size();
-        if (total == 0) {
-            return false;
-        }
-        ggml_cuda_set_device(cuda_ctx->device);
-        if (cudaMalloc(&ring.dev_mem, total) != cudaSuccess) {
-            cudaGetLastError();
-            GGML_LOG_WARN("%s: op-offload prefetch ring allocation of %zu MiB failed - prefetch disabled\n", __func__, total >> 20);
-            return false;
-        }
-        ring.total_bytes = total;
-        ring.slot_bytes = total / ring.n_slots;
-        ring.slots.resize(ring.n_slots);
-        CUDA_CHECK(cudaStreamCreateWithFlags(&ring.dma_stream, cudaStreamNonBlocking));
-        GGML_LOG_INFO("%s: op-offload prefetch ring allocated: %zu MiB total, %d slots x %zu MiB, chunk %zu MiB\n",
-                      __func__, total >> 20, ring.n_slots, ring.slot_bytes >> 20, ring.chunk_bytes >> 20);
-    }
-
-    if (nbytes > ring.slot_bytes) {
-        return false;
-    }
-
-    int slot_idx = -1;
-    for (int i = 0; i < ring.n_slots; i++) {
-        auto & s = ring.slots[i];
-        if (s.free_event == nullptr || cudaEventQuery(s.free_event) == cudaSuccess) {
-            slot_idx = i;
-            break;
-        }
-    }
-    if (slot_idx < 0) {
-        return false;
-    }
-
-    auto & S = ring.slots[slot_idx];
-    if (S.free_event != nullptr) {
-        CUDA_CHECK(cudaStreamWaitEvent(ring.dma_stream, S.free_event, 0));
-    }
-
-    const int n_chunks = (int)((nbytes + ring.chunk_bytes - 1) / ring.chunk_bytes);
-    S.chunk_events.resize(n_chunks);
-    for (int k = 0; k < n_chunks; k++) {
-        if (S.chunk_events[k] == nullptr) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&S.chunk_events[k], cudaEventDisableTiming));
-        }
-        const size_t off = (size_t)k * ring.chunk_bytes;
-        const size_t len = std::min(ring.chunk_bytes, nbytes - off);
-        char * dst = ring.dev_mem + (size_t)slot_idx * ring.slot_bytes + off;
-        CUDA_CHECK(cudaMemcpyAsync(dst, (const char *)data + off, len, cudaMemcpyHostToDevice, ring.dma_stream));
-        CUDA_CHECK(cudaEventRecord(S.chunk_events[k], ring.dma_stream));
-    }
-
-    ring.pending[tensor] = slot_idx;
-    return true;
-}
-
 static bool ggml_backend_cuda_offload_commit(ggml_backend_t backend, ggml_tensor * tensor) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     auto & ring = cuda_ctx->offload_prefetch;
@@ -2575,165 +2485,100 @@ static bool ggml_backend_cuda_offload_commit(ggml_backend_t backend, ggml_tensor
         return false;
     }
 
-    // staged transfer (mode 3): D2D each staged range; the caller has already ordered
+    // staged transfer: D2D each published range; the caller has already ordered
     // the compute stream after the input-copy reuse point
-    {
-        // if the worker has not published this tensor yet, wait briefly: the staging
-        // memcpy is usually close to done, and waiting beats a full stock copy
-        std::unique_lock<std::mutex> lock(ring.mtx);
-        auto it = ring.ready.find(tensor);
-        if (it == ring.ready.end() && !ring.canceled.count(tensor) && ring.worker.joinable()) {
-            const auto * key = tensor;
-            ring.cv_ready.wait_for(lock, std::chrono::milliseconds(30), [&]{ return ring.ready.count(key) > 0 || ring.canceled.count(key) > 0; });
-            it = ring.ready.find(tensor);
+    if (!ring.workers.empty()) {
+        std::vector<ggml_cuda_staged_ready> entries;
+        {
+            // wait until every task of this tensor resolved (published or dropped);
+            // the deadline keeps a late worker from stalling the split loop
+            std::unique_lock<std::mutex> lock(ring.mtx);
+            if (ring.pending_tasks.count(tensor) != 0) {
+                const auto * key = tensor;
+                const char * wait_env = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_COMMIT_WAIT_MS");
+                const int wait_ms = wait_env ? atoi(wait_env) : 30;
+                ring.cv_ready.wait_for(lock, std::chrono::milliseconds(wait_ms), [&]{
+                    return ring.pending_tasks.count(key) == 0;
+                });
+            }
+            auto rit = ring.ready.find(tensor);
+            if (rit != ring.ready.end()) {
+                entries = std::move(rit->second);
+                ring.ready.erase(rit);
+            }
+            if (ring.pending_tasks.count(tensor) != 0) {
+                // partial or nothing staged in time: drop the remaining tasks so the
+                // workers free their slots instead of finishing an unusable transfer
+                ring.canceled.insert(tensor);
+                ring.cv_work.notify_all();
+            }
         }
-        if (it != ring.ready.end()) {
-            const int slot_idx = it->second.slot;
-            const void * src_host = it->second.src_host;
-            const auto ranges = it->second.ranges;
-            const auto range_events = it->second.range_events;
-            ring.ready.erase(it);
-            lock.unlock();
+        if (entries.empty()) {
+            return false;
+        }
 
-            ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_set_device(cuda_ctx->device);
 
-            cudaStream_t cs = cuda_ctx->stream();
-            auto & S = ring.slots[slot_idx];
-            const char * src = ring.dev_mem + (size_t)slot_idx * ring.slot_bytes;
-            if (getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_VERIFY")) {
-                static int checked_tensors = 0, bad_ranges = 0;
-                for (size_t k = 0; k < ranges.size(); k++) {
-                    CUDA_CHECK(cudaEventSynchronize(range_events[k]));
-                    std::vector<char> back(ranges[k].len);
-                    CUDA_CHECK(cudaMemcpyAsync(back.data(), src + ranges[k].offset, ranges[k].len, cudaMemcpyDeviceToHost, cs));
-                    CUDA_CHECK(cudaStreamSynchronize(cs));
-                    if (memcmp(back.data(), (const char *)src_host + ranges[k].offset, ranges[k].len) != 0) {
-                        bad_ranges++;
-                        if (bad_ranges < 8) {
-                            size_t firstdiff = 0;
-                            while (firstdiff < ranges[k].len && back[firstdiff] == ((const char *)src_host + ranges[k].offset)[firstdiff]) firstdiff++;
-                            fprintf(stderr, "VERIFY: tensor %s range %zu off=%zu len=%zu MISMATCH firstdiff@%zu\n",
-                                    tensor->name, k, ranges[k].offset, ranges[k].len, firstdiff);
-                        }
+        cudaStream_t cs = cuda_ctx->stream();
+
+        if (getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_VERIFY")) {
+            static int checked_tensors = 0, bad_ranges = 0;
+            for (const auto & e : entries) {
+                CUDA_CHECK(cudaEventSynchronize(e.event));
+                std::vector<char> back(e.len);
+                CUDA_CHECK(cudaMemcpyAsync(back.data(), ring.dev_mem + (size_t)e.slot * ring.slot_bytes + e.dst_offset, e.len, cudaMemcpyDeviceToHost, cs));
+                CUDA_CHECK(cudaStreamSynchronize(cs));
+                if (memcmp(back.data(), (const char *)e.src_host + e.tensor_offset, e.len) != 0) {
+                    bad_ranges++;
+                    if (bad_ranges < 8) {
+                        size_t firstdiff = 0;
+                        while (firstdiff < e.len && back[firstdiff] == ((const char *)e.src_host + e.tensor_offset)[firstdiff]) firstdiff++;
+                        fprintf(stderr, "VERIFY: tensor %s range off=%zu len=%zu MISMATCH firstdiff@%zu\n",
+                                tensor->name, e.tensor_offset, e.len, firstdiff);
                     }
                 }
-                checked_tensors++;
-                if (checked_tensors % 27 == 0) {
-                    fprintf(stderr, "VERIFY: %d tensors checked, %d bad ranges\n", checked_tensors, bad_ranges);
-                }
             }
-            for (size_t k = 0; k < ranges.size(); k++) {
-                CUDA_CHECK(cudaStreamWaitEvent(cs, range_events[k], 0));
-                CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + ranges[k].offset, src + ranges[k].offset, ranges[k].len, cudaMemcpyDeviceToDevice, cs));
+            checked_tensors++;
+            if (checked_tensors % 27 == 0) {
+                fprintf(stderr, "VERIFY: %d tensors checked, %d bad ranges\n", checked_tensors, bad_ranges);
             }
-            CUDA_CHECK(cudaEventRecord(S.free_event, cs));
-            {
-                std::lock_guard<std::mutex> lock(ring.mtx);
-                ring.slot_occupied[slot_idx] = false;
-            }
-            ring.cv_work.notify_all();
-            return true;
         }
-    }
 
-    auto it = ring.pending.find(tensor);
-    if (it == ring.pending.end()) {
-        return false;
-    }
-    const int slot_idx = it->second;
-    ring.pending.erase(it);
-
-    ggml_cuda_set_device(cuda_ctx->device);
-
-    cudaStream_t cs = cuda_ctx->stream();
-    auto & S = ring.slots[slot_idx];
-    const size_t nbytes = ggml_nbytes(tensor);
-    const int n_chunks = (int)S.chunk_events.size();
-    for (int k = 0; k < n_chunks; k++) {
-        const size_t off = (size_t)k * ring.chunk_bytes;
-        const size_t len = std::min(ring.chunk_bytes, nbytes - off);
-        CUDA_CHECK(cudaStreamWaitEvent(cs, S.chunk_events[k], 0));
-        const char * src = ring.dev_mem + (size_t)slot_idx * ring.slot_bytes + off;
-        CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + off, src, len, cudaMemcpyDeviceToDevice, cs));
-    }
-    if (S.free_event == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&S.free_event, cudaEventDisableTiming));
-    }
-    CUDA_CHECK(cudaEventRecord(S.free_event, cs));
-    return true;
-}
-
-static bool ggml_backend_cuda_offload_dma_copy(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
-
-    auto & ring = cuda_ctx->offload_prefetch;
-
-    ggml_cuda_set_device(cuda_ctx->device);
-
-    if (ring.dma_stream == nullptr) {
-        CUDA_CHECK(cudaStreamCreateWithFlags(&ring.dma_stream, cudaStreamNonBlocking));
-    }
-    if (ring.dma_bridge_event == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&ring.dma_bridge_event, cudaEventDisableTiming));
-    }
-    if (ring.dma_done_event == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&ring.dma_done_event, cudaEventDisableTiming));
-    }
-
-    cudaStream_t cs = cuda_ctx->stream();
-
-    // order the write after everything the compute stream waits on (input-copy buffer reuse)
-    CUDA_CHECK(cudaEventRecord(ring.dma_bridge_event, cs));
-    CUDA_CHECK(cudaStreamWaitEvent(ring.dma_stream, ring.dma_bridge_event, 0));
-
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, ring.dma_stream));
-
-    // order the split graph enqueued later on the compute stream after the copy
-    CUDA_CHECK(cudaEventRecord(ring.dma_done_event, ring.dma_stream));
-    CUDA_CHECK(cudaStreamWaitEvent(cs, ring.dma_done_event, 0));
-
-    return true;
-}
-
-static bool ggml_backend_cuda_offload_readback(ggml_backend_t backend, const ggml_tensor * tensor, void * dst, size_t offset, size_t size) {
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
-
-    auto & ring = cuda_ctx->offload_prefetch;
-
-    ggml_cuda_set_device(cuda_ctx->device);
-
-    if (ring.readback_pinned_size < size) {
-        if (ring.readback_pinned != nullptr) {
-            CUDA_CHECK(cudaFreeHost(ring.readback_pinned));
+        // release each involved slot right after the last D2D that reads it
+        std::unordered_map<int, size_t> last_use;
+        for (size_t k = 0; k < entries.size(); k++) {
+            last_use[entries[k].slot] = k;
         }
-        CUDA_CHECK(cudaHostAlloc(&ring.readback_pinned, size, cudaHostAllocDefault));
-        ring.readback_pinned_size = size;
+        for (size_t k = 0; k < entries.size(); k++) {
+            const auto & e = entries[k];
+            CUDA_CHECK(cudaStreamWaitEvent(cs, e.event, 0));
+            CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + e.tensor_offset,
+                                       ring.dev_mem + (size_t)e.slot * ring.slot_bytes + e.dst_offset,
+                                       e.len, cudaMemcpyDeviceToDevice, cs));
+            if (last_use[e.slot] == k) {
+                CUDA_CHECK(cudaEventRecord(ring.slots[e.slot].free_event, cs));
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(ring.mtx);
+            for (const auto & lu : last_use) {
+                ring.slot_state[lu.first] = SLOT_FREE;
+            }
+            auto & cr = ring.committed[tensor];
+            for (const auto & e : entries) {
+                cr.push_back({e.tensor_offset, e.dst_offset, e.len});
+            }
+        }
+        ring.cv_work.notify_all();
+        return true;
     }
-    if (ring.readback_event == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&ring.readback_event, cudaEventDisableTiming));
-    }
 
-    cudaStream_t cs = cuda_ctx->stream();
-
-    // the host waits only for this readback (and the work it depends on), not for a full device drain
-    CUDA_CHECK(cudaMemcpyAsync(ring.readback_pinned, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cs));
-    CUDA_CHECK(cudaEventRecord(ring.readback_event, cs));
-    CUDA_CHECK(cudaEventSynchronize(ring.readback_event));
-
-    memcpy(dst, ring.readback_pinned, size);
-
-    return true;
+    return false;
 }
 
-// staged transfer: a worker thread copies the used ranges of a host tensor into pinned slots,
-// the DMA stream drains them into device slots, and offload_commit moves them into the
-// destination tensor on the compute stream (callers must order that after their reuse wait)
+// staged transfer: worker threads copy host ranges into pinned slots, the DMA stream
+// drains them into device slots, and offload_commit moves them into the destination
+// tensor on the compute stream (callers must order that after their reuse wait)
 
 static bool ggml_cuda_offload_staging_init(ggml_backend_cuda_context * cuda_ctx) {
     auto & ring = cuda_ctx->offload_prefetch;
@@ -2761,7 +2606,7 @@ static bool ggml_cuda_offload_staging_init(ggml_backend_cuda_context * cuda_ctx)
         ring.slot_bytes = total / ring.n_slots;
         ring.slots.resize(ring.n_slots);
         ring.slot_dma_events.resize(ring.n_slots, nullptr);
-        ring.slot_occupied.assign(ring.n_slots, false);
+        ring.slot_state.assign(ring.n_slots, SLOT_FREE);
         for (int i = 0; i < ring.n_slots; i++) {
             if (ring.slots[i].free_event == nullptr) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&ring.slots[i].free_event, cudaEventDisableTiming));
@@ -2771,8 +2616,12 @@ static bool ggml_cuda_offload_staging_init(ggml_backend_cuda_context * cuda_ctx)
             }
         }
         CUDA_CHECK(cudaStreamCreateWithFlags(&ring.dma_stream, cudaStreamNonBlocking));
-        GGML_LOG_INFO("%s: op-offload staging ring: %zu MiB total, %d slots x %zu MiB (device + pinned)\n",
-                      __func__, total >> 20, ring.n_slots, ring.slot_bytes >> 20);
+        {
+            const char * workers_env = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_WORKERS");
+            ring.n_workers = workers_env ? std::min(8, std::max(1, atoi(workers_env))) : 2;
+        }
+        GGML_LOG_INFO("%s: op-offload staging ring: %zu MiB total, %d slots x %zu MiB (device + pinned), %d workers\n",
+                      __func__, total >> 20, ring.n_slots, ring.slot_bytes >> 20, ring.n_workers);
     }
     return true;
 }
@@ -2784,14 +2633,14 @@ static void ggml_cuda_offload_worker(ggml_backend_cuda_context * cuda_ctx, ggml_
     while (true) {
         auto free_slot = [&]() -> int {
             for (int i = 0; i < ring.n_slots; i++) {
-                if (!ring.slot_occupied[i]) {
+                if (ring.slot_state[i] == SLOT_FREE) {
                     return i;
                 }
             }
             return -1;
         };
-        // wait for a task whose slot is free: a slot stays occupied until its consuming
-        // commit (or pass begin) releases it, so staged bytes cannot be overwritten early
+        // wait for a task with a free slot: only FREE slots are taken - a STAGING slot is
+        // owned by another worker until it drops or publishes, a READY slot awaits its commit
         ring.cv_work.wait(lock, [&]{ return ring.stop_worker.load() || (!ring.queue.empty() && free_slot() >= 0); });
         if (ring.stop_worker.load()) {
             break;
@@ -2800,12 +2649,25 @@ static void ggml_cuda_offload_worker(ggml_backend_cuda_context * cuda_ctx, ggml_
         ring.queue.erase(ring.queue.begin());
         const bool task_canceled = ring.canceled.count(task.tensor) > 0;
         const int slot_idx = free_slot();
-        ring.slot_occupied[slot_idx] = true;
+        ring.slot_state[slot_idx] = SLOT_STAGING;
         lock.unlock();
+
+        // resolve a task without publishing: free the slot, drop the pending count
+        auto drop_task = [&]() {
+            ring.slot_state[slot_idx] = SLOT_FREE;
+            if (task.epoch != ring.pass_epoch) {
+                return; // stale pass: its pending count is already gone
+            }
+            auto it = ring.pending_tasks.find(task.tensor);
+            if (it != ring.pending_tasks.end() && --it->second == 0) {
+                ring.pending_tasks.erase(it);
+                ring.cv_ready.notify_all();
+            }
+        };
 
         if (task_canceled) {
             lock.lock();
-            ring.slot_occupied[slot_idx] = false;
+            drop_task();
             continue;
         }
 
@@ -2823,11 +2685,11 @@ static void ggml_cuda_offload_worker(ggml_backend_cuda_context * cuda_ctx, ggml_
         size_t staged = 0;
         bool ok = true;
         for (const auto & r : task.ranges) {
-            if (r.offset + r.len > max_off) {
+            if (r.dst_offset + r.len > max_off) {
                 ok = false;
                 break;
             }
-            memcpy(pin + r.offset, (const char *)task.src_host + r.offset, r.len);
+            memcpy(pin + r.dst_offset, (const char *)task.src_host + r.src_offset, r.len);
             staged += r.len;
         }
         if (ok && staged > 0) {
@@ -2838,7 +2700,7 @@ static void ggml_cuda_offload_worker(ggml_backend_cuda_context * cuda_ctx, ggml_
                 if (S.chunk_events[k] == nullptr) {
                     CUDA_CHECK(cudaEventCreateWithFlags(&S.chunk_events[k], cudaEventDisableTiming));
                 }
-                CUDA_CHECK(cudaMemcpyAsync(dev + r.offset, pin + r.offset, r.len, cudaMemcpyHostToDevice, ring.dma_stream));
+                CUDA_CHECK(cudaMemcpyAsync(dev + r.dst_offset, pin + r.dst_offset, r.len, cudaMemcpyHostToDevice, ring.dma_stream));
                 CUDA_CHECK(cudaEventRecord(S.chunk_events[k], ring.dma_stream));
             }
             CUDA_CHECK(cudaEventRecord(ring.slot_dma_events[slot_idx], ring.dma_stream));
@@ -2846,23 +2708,34 @@ static void ggml_cuda_offload_worker(ggml_backend_cuda_context * cuda_ctx, ggml_
             lock.lock();
             if (task.epoch == ring.pass_epoch && !ring.canceled.count(task.tensor)) {
                 // publish only if this pass is still current; stale passes' tensors are gone
-                auto & rd = ring.ready[task.tensor];
-                rd.slot = slot_idx;
-                rd.src_host = task.src_host;
-                rd.ranges = task.ranges;
-                rd.range_events = S.chunk_events;
-                // the slot is released by the consuming commit, or by pass begin if abandoned
+                for (size_t k = 0; k < task.ranges.size(); k++) {
+                    ggml_cuda_staged_ready rd;
+                    rd.slot = slot_idx;
+                    rd.tensor_offset = task.ranges[k].src_offset;
+                    rd.dst_offset = task.ranges[k].dst_offset;
+                    rd.len = task.ranges[k].len;
+                    rd.event = S.chunk_events[k];
+                    rd.src_host = task.src_host;
+                    ring.ready[task.tensor].push_back(std::move(rd));
+                }
+                auto it = ring.pending_tasks.find(task.tensor);
+                if (it != ring.pending_tasks.end() && --it->second == 0) {
+                    ring.pending_tasks.erase(it);
+                }
+                // READY until the consuming commit (or a later pass begin) releases the slot
+                ring.slot_state[slot_idx] = SLOT_READY;
                 lock.unlock();
                 ring.cv_ready.notify_all();
             } else {
-                ring.slot_occupied[slot_idx] = false;
+                drop_task();
                 lock.unlock();
                 ring.cv_work.notify_all();
             }
         } else {
             lock.lock();
-            ring.slot_occupied[slot_idx] = false;
+            drop_task();
             lock.unlock();
+            ring.cv_work.notify_all();
         }
         lock.lock();
     }
@@ -2876,66 +2749,94 @@ static bool ggml_backend_cuda_offload_prefetch_set(ggml_backend_t backend, ggml_
         return false;
     }
 
-    // MUL_MAT_ID weights: ne[2] experts of nb[2] bytes each
-    const int64_t n_expert = tensor->ne[2];
-    const size_t expert_size = tensor->nb[2];
-    const size_t nwords = ggml_bitset_size(n_expert);
-    if (used_bits_nbytes < nwords * sizeof(ggml_bitset_t) || n_expert <= 0 || expert_size == 0) {
-        return false;
-    }
-    const ggml_bitset_t * bits = (const ggml_bitset_t *) used_bits;
+    std::vector<ggml_cuda_staged_task> tasks;
 
-    // group consecutive used experts, mirroring the scheduler's copy_experts grouping and padding
-    std::vector<ggml_cuda_staged_range> ranges;
-    int64_t id = 0;
-    while (id < n_expert && !ggml_bitset_get(bits, id)) {
-        id++;
-    }
-    if (id >= n_expert) {
-        return false;
-    }
-    const size_t padding = std::min<size_t>(expert_size, 512);
-    while (id < n_expert) {
-        int64_t last = id;
-        while (last + 1 < n_expert && ggml_bitset_get(bits, last + 1)) {
-            last++;
+    if (used_bits == nullptr) {
+        // full-set staging: slice the whole tensor into slot-sized tasks, one slot each,
+        // so the publish and catch-up unit is a slice, not the tensor
+        const size_t nbytes = ggml_nbytes(tensor);
+        if (nbytes == 0) {
+            return false;
         }
-        const size_t off = (size_t)id * expert_size;
-        size_t len = (size_t)(last - id + 1) * expert_size;
-        if (last < n_expert - 1) {
-            len += padding;
+        for (size_t off = 0; off < nbytes; off += ring.slot_bytes) {
+            const size_t len = std::min(ring.slot_bytes, nbytes - off);
+            ggml_cuda_staged_task task;
+            task.tensor = tensor;
+            task.src_host = data;
+            task.ranges.push_back({off, 0, len});
+            task.epoch = ring.pass_epoch;
+            tasks.push_back(std::move(task));
         }
-        ranges.push_back({off, len});
-        id = last + 1;
+    } else {
+        // MUL_MAT_ID weights: ne[2] experts of nb[2] bytes each
+        const int64_t n_expert = tensor->ne[2];
+        const size_t expert_size = tensor->nb[2];
+        const size_t nwords = ggml_bitset_size(n_expert);
+        if (used_bits_nbytes < nwords * sizeof(ggml_bitset_t) || n_expert <= 0 || expert_size == 0) {
+            return false;
+        }
+        const ggml_bitset_t * bits = (const ggml_bitset_t *) used_bits;
+
+        // group consecutive used experts, mirroring the scheduler's copy_experts grouping and padding
+        std::vector<ggml_cuda_staged_range> ranges;
+        int64_t id = 0;
         while (id < n_expert && !ggml_bitset_get(bits, id)) {
             id++;
         }
-    }
-
-    size_t total = 0;
-    for (auto & r : ranges) {
-        total += r.len;
-        if (r.offset + r.len > ring.slot_bytes) {
+        if (id >= n_expert) {
             return false;
         }
-    }
-    if (total == 0) {
-        return false;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(ring.mtx);
-        if (!ring.worker.joinable()) {
-            ring.worker = std::thread(ggml_cuda_offload_worker, cuda_ctx, backend);
+        const size_t padding = std::min<size_t>(expert_size, 512);
+        while (id < n_expert) {
+            int64_t last = id;
+            while (last + 1 < n_expert && ggml_bitset_get(bits, last + 1)) {
+                last++;
+            }
+            const size_t off = (size_t)id * expert_size;
+            size_t len = (size_t)(last - id + 1) * expert_size;
+            if (last < n_expert - 1) {
+                len += padding;
+            }
+            ranges.push_back({off, off, len});
+            id = last + 1;
+            while (id < n_expert && !ggml_bitset_get(bits, id)) {
+                id++;
+            }
         }
+
+        size_t total = 0;
+        for (auto & r : ranges) {
+            total += r.len;
+            if (r.dst_offset + r.len > ring.slot_bytes) {
+                return false;
+            }
+        }
+        if (total == 0) {
+            return false;
+        }
+
         ggml_cuda_staged_task task;
         task.tensor = tensor;
         task.src_host = data;
         task.ranges = std::move(ranges);
         task.epoch = ring.pass_epoch;
-        ring.queue.push_back(std::move(task));
+        tasks.push_back(std::move(task));
     }
-    ring.cv_work.notify_one();
+
+    {
+        std::lock_guard<std::mutex> lock(ring.mtx);
+        if (ring.workers.empty()) {
+            ring.workers.resize(ring.n_workers);
+            for (auto & w : ring.workers) {
+                w = std::thread(ggml_cuda_offload_worker, cuda_ctx, backend);
+            }
+        }
+        ring.pending_tasks[tensor] += tasks.size();
+        for (auto & t : tasks) {
+            ring.queue.push_back(std::move(t));
+        }
+    }
+    ring.cv_work.notify_all();
     return true;
 }
 
@@ -2951,8 +2852,15 @@ static void ggml_backend_cuda_offload_pass_begin(ggml_backend_t backend) {
         ring.ready.clear();
         ring.queue.clear();
         ring.canceled.clear();
-        for (int i = 0; i < (int)ring.slot_occupied.size(); i++) {
-            ring.slot_occupied[i] = false;
+        ring.pending_tasks.clear();
+        ring.committed.clear();
+        // release READY slots (their consumers are gone); STAGING slots stay with their
+        // workers, which drop them via the epoch guard below - taking one over would let
+        // a stale pass interleave its DMAs into a slot a new task is filling
+        for (int i = 0; i < (int)ring.slot_state.size(); i++) {
+            if (ring.slot_state[i] == SLOT_READY) {
+                ring.slot_state[i] = SLOT_FREE;
+            }
         }
         ring.pass_epoch++;
     }
@@ -2965,16 +2873,55 @@ static void ggml_backend_cuda_offload_cancel(ggml_backend_t backend, const ggml_
 
     {
         std::lock_guard<std::mutex> lock(ring.mtx);
-        auto it = ring.ready.find(tensor);
-        if (it != ring.ready.end()) {
-            ring.slot_occupied[it->second.slot] = false;
-            ring.ready.erase(it);
+        auto rit = ring.ready.find(tensor);
+        if (rit != ring.ready.end()) {
+            for (const auto & e : rit->second) {
+                ring.slot_state[e.slot] = SLOT_FREE;
+            }
+            ring.ready.erase(rit);
         } else {
-            // still queued or mid-staging: the worker checks the set before publishing
+            // still queued or mid-staging: the workers check the set before publishing
             ring.canceled.insert(tensor);
         }
     }
     ring.cv_work.notify_all();
+}
+
+// is [offset, offset+size) of dst already filled by this pass's staged commits?
+static bool ggml_backend_cuda_offload_covers(ggml_backend_t backend, const ggml_tensor * tensor, size_t offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    auto & ring = cuda_ctx->offload_prefetch;
+
+    if (size == 0) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(ring.mtx);
+    auto it = ring.committed.find(tensor);
+    if (it == ring.committed.end()) {
+        return false;
+    }
+    // walk the committed ranges in offset order, extending the covered reach; a range
+    // may start before the query and straddle it, so sort instead of exact matching
+    std::vector<ggml_cuda_staged_range> rs = it->second;
+    std::sort(rs.begin(), rs.end(), [](const ggml_cuda_staged_range & a, const ggml_cuda_staged_range & b) {
+        return a.src_offset < b.src_offset;
+    });
+    size_t need = offset + size;
+    size_t reach = offset;
+    for (const auto & r : rs) {
+        if (r.src_offset + r.len <= reach) {
+            continue;
+        }
+        if (r.src_offset > reach) {
+            break;
+        }
+        reach = r.src_offset + r.len;
+        if (reach >= need) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -5125,11 +5072,9 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
-    /* .offload_prefetch        = */ ggml_backend_cuda_offload_prefetch,
     /* .offload_commit          = */ ggml_backend_cuda_offload_commit,
-    /* .offload_dma_copy        = */ ggml_backend_cuda_offload_dma_copy,
-    /* .offload_readback        = */ ggml_backend_cuda_offload_readback,
     /* .offload_prefetch_set    = */ ggml_backend_cuda_offload_prefetch_set,
+    /* .offload_covers          = */ ggml_backend_cuda_offload_covers,
     /* .offload_pass_begin      = */ ggml_backend_cuda_offload_pass_begin,
     /* .offload_cancel          = */ ggml_backend_cuda_offload_cancel,
 };

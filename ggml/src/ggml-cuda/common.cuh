@@ -1417,20 +1417,31 @@ struct ggml_cuda_stream_context {
     }
 };
 
-// op-offload staged transfer: range lists passed between scheduler, staging worker and commit
-struct ggml_cuda_staged_range { size_t offset; size_t len; };
+// op-offload staged transfer: range lists passed between scheduler, staging workers and commit
+// src_offset is the position in the source tensor, dst_offset the position in the staging slot
+// (equal for whole-tensor tasks, different for slot-sized slices of a full-set staging)
+struct ggml_cuda_staged_range { size_t src_offset; size_t dst_offset; size_t len; };
 struct ggml_cuda_staged_task {
     const ggml_tensor * tensor;
     const void * src_host;
     std::vector<ggml_cuda_staged_range> ranges;
     uint64_t epoch;
 };
+// one published range: event = DMA completion of the range inside its slot
 struct ggml_cuda_staged_ready {
     int slot;
-    const void * src_host = nullptr;
-    std::vector<ggml_cuda_staged_range> ranges;
-    std::vector<cudaEvent_t> range_events;
+    size_t tensor_offset;
+    size_t dst_offset;
+    size_t len;
+    cudaEvent_t event;
+    const void * src_host;
 };
+
+// staged-transfer slot lifecycle: FREE -> STAGING (owned by a worker) -> READY
+// (awaiting commit) -> FREE; pass_begin may release READY slots only - a STAGING slot
+// is released by its worker (epoch guard), never taken over, so a stale pass cannot
+// interleave DMAs into a slot a new task is filling
+enum ggml_cuda_slot_state { SLOT_FREE = 0, SLOT_STAGING = 1, SLOT_READY = 2 };
 
 struct ggml_backend_cuda_context {
     int device;
@@ -1508,34 +1519,30 @@ struct ggml_backend_cuda_context {
         size_t total_bytes = 0;
         size_t slot_bytes = 0;
         int n_slots = 6;
-        size_t chunk_bytes = size_t(8) << 20;
         cudaStream_t dma_stream = nullptr;
         struct slot_state {
             cudaEvent_t free_event = nullptr;
             std::vector<cudaEvent_t> chunk_events;
         };
         std::vector<slot_state> slots;
-        std::unordered_map<const void *, int> pending;
-        // filter+dma mode: no ring, the DMA stream carries used-expert range copies
-        cudaEvent_t dma_bridge_event = nullptr;
-        cudaEvent_t dma_done_event = nullptr;
-        cudaEvent_t readback_event = nullptr;
-        void * readback_pinned = nullptr;
-        size_t readback_pinned_size = 0;
-        // staged-transfer mode: worker thread fills pinned slots, DMA drains them
+        // staged-transfer mode: worker threads fill pinned slots, DMA drains them
         char * pinned_mem = nullptr;
         std::vector<cudaEvent_t> slot_dma_events;  // last DMA issued per slot
-        std::vector<bool> slot_occupied;           // staged data awaiting its commit
+        std::vector<uint8_t> slot_state;           // ggml_cuda_slot_state per slot
         std::unordered_set<const void *> canceled; // commits that arrived before staging
-        std::thread worker;
+        std::vector<std::thread> workers;
+        int n_workers = 2;
         std::mutex mtx;
         std::condition_variable cv_work;
         std::condition_variable cv_ready;          // commit waits for a specific tensor here
         std::vector<ggml_cuda_staged_task> queue;
-        std::unordered_map<const void *, ggml_cuda_staged_ready> ready;
+        // published ranges per tensor; pending_tasks counts issued but unresolved tasks
+        std::unordered_map<const void *, std::vector<ggml_cuda_staged_ready>> ready;
+        std::unordered_map<const void *, size_t> pending_tasks;
+        // ranges moved into destination tensors by commit, for the coverage query
+        std::unordered_map<const void *, std::vector<ggml_cuda_staged_range>> committed;
         std::atomic<bool> stop_worker{false};
         uint64_t pass_epoch = 0;
-        bool worker_failed = false;
     } offload_prefetch;
 
     ~ggml_backend_cuda_context();
