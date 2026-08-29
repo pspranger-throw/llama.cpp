@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1605,10 +1608,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     const char * op_offload_env = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH");
     const int op_offload_mode = op_offload_env ? atoi(op_offload_env) : 0;
-    // mode 1: ring lookahead prefetch (v0.1), mode 2: used-expert filter + DMA stream (v0.2)
+    // mode 1: ring lookahead prefetch (v0.1, deprecated - racy), mode 2: used-expert filter + DMA
+    // stream, mode 3: staged transfer with used-set prediction (pinned ring + worker thread)
     const bool op_offload_prefetch = !sched->callback_eval && op_offload_mode == 1;
     const bool op_offload_dma = !sched->callback_eval && op_offload_mode == 2;
-    const bool op_offload_prefetch_dbg = (op_offload_prefetch || op_offload_dma) && getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG") != nullptr;
+    const bool op_offload_staged = !sched->callback_eval && op_offload_mode == 3;
+    const bool op_offload_prefetch_dbg = (op_offload_prefetch || op_offload_dma || op_offload_staged) && getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DEBUG") != nullptr;
+    static std::mutex op_offload_bits_mtx;
+    static std::unordered_map<std::string, std::vector<uint8_t>> op_offload_bits_cache;
+    // bits actually staged for this pass (what the coverage check must compare against)
+    std::unordered_map<std::string, std::vector<uint8_t>> op_offload_staged_bits;
     if (op_offload_prefetch_dbg) {
         int mmid_b[3] = {0, 0, 0};
         for (int i = 0; i < sched->n_splits; i++) {
@@ -1622,6 +1631,63 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
     const bool op_offload_prefetch_eager = op_offload_prefetch && getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_EAGER") != nullptr;
     std::vector<const ggml_tensor *> prefetch_issued;
+
+    if (op_offload_staged) {
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (sched->backends[b]->iface.offload_pass_begin != NULL) {
+                sched->backends[b]->iface.offload_pass_begin(sched->backends[b]);
+            }
+        }
+        // issue staged transfers for all op-offloaded expert weights of this pass up front:
+        // the worker thread streams ahead while the splits compute; slot events throttle it
+        int staged_issued = 0;
+        for (int j = 0; j < sched->n_splits; j++) {
+            struct ggml_backend_sched_split * ns = &splits[j];
+            if (ns->graph.n_nodes == 0 || ns->graph.nodes[0]->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            ggml_backend_t nb = sched->backends[ns->backend_id];
+            if (nb->iface.offload_prefetch_set == NULL) {
+                continue;
+            }
+            struct ggml_tensor * nnode = ns->graph.nodes[0];
+            for (int ii = 0; ii < ns->n_inputs; ii++) {
+                struct ggml_tensor * ninp = ns->inputs[ii];
+                if (ninp->buffer == NULL ||
+                    ggml_backend_buffer_get_usage(ninp->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                    !ggml_backend_buffer_is_host(ninp->buffer)) {
+                    continue;
+                }
+                struct ggml_tensor * ncpy = tensor_copy(ninp, ns->backend_id, sched->cur_copy);
+                if (nnode->src[0] != ncpy) {
+                    continue;
+                }
+                std::vector<uint8_t> bits;
+                {
+                    std::lock_guard<std::mutex> lock(op_offload_bits_mtx);
+                    auto cit = op_offload_bits_cache.find(ninp->name);
+                    if (cit == op_offload_bits_cache.end()) {
+                        continue;
+                    }
+                    bits = cit->second;
+                }
+                if (nb->iface.offload_prefetch_set(nb, ncpy, ninp->data, bits.data(), bits.size())) {
+                    staged_issued++;
+                    op_offload_staged_bits[ninp->name] = std::move(bits);
+                    if (op_offload_prefetch_dbg) {
+                        static int issued = 0;
+                        if (issued < 12) {
+                            fprintf(stderr, "PREFETCHDBG: issue[%d] key='%s'\n", issued++, ninp->name);
+                        }
+                    }
+                }
+            }
+        }
+        if (op_offload_prefetch_dbg) {
+            static int passes = 0;
+            fprintf(stderr, "PREFETCHDBG: pass %d: staged transfers issued for %d tensors\n", ++passes, staged_issued);
+        }
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1705,7 +1771,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
-                        if (!(op_offload_dma && ids_backend->iface.offload_readback != NULL &&
+                        if (!((op_offload_dma || op_offload_staged) && ids_backend->iface.offload_readback != NULL &&
                               ids_backend->iface.offload_readback(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor)))) {
                             ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                             ggml_backend_synchronize(ids_backend);
@@ -1725,13 +1791,101 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    if (op_offload_staged) {
+                        // merge this pass's used set into the prediction cache: consecutive
+                        // passes cover different token sets (ubatches, requests), so a plain
+                        // overwrite would predict the wrong set; the union over-stages a
+                        // little but converges to full coverage for recurring content
+                        std::lock_guard<std::mutex> lock(op_offload_bits_mtx);
+                        auto & cached = op_offload_bits_cache[input->name];
+                        const size_t nbytes_cache = used_ids.size() * sizeof(ggml_bitset_t);
+                        if (cached.size() != nbytes_cache) {
+                            cached.assign((const uint8_t *) used_ids.data(), (const uint8_t *) used_ids.data() + nbytes_cache);
+                        } else {
+                            ggml_bitset_t * dst = (ggml_bitset_t *) cached.data();
+                            const ggml_bitset_t * src = (const ggml_bitset_t *) used_ids.data();
+                            for (size_t w = 0; w < used_ids.size(); w++) {
+                                dst[w] |= src[w];
+                            }
+                        }
+                        if (op_offload_prefetch_dbg) {
+                            static int stores = 0;
+                            if (stores < 12) {
+                                int pop = 0;
+                                for (int e = 0; e < n_expert; e++) {
+                                    if (ggml_bitset_get(used_ids.data(), e)) pop++;
+                                }
+                                fprintf(stderr, "PREFETCHDBG: store[%d] key='%s' used=%d/%d\n", stores++, input->name, pop, (int)n_expert);
+                            }
+                        }
+                    }
+
+                    // staged transfer: commit the prefetched ranges, then stock-copy only groups
+                    // the staged prediction missed (or everything if the staged transfer fell behind)
+                    const std::vector<uint8_t> * predicted_bits = nullptr;
+                    bool staged_commit = false;
+                    if (op_offload_staged && split_backend->iface.offload_commit != NULL) {
+                        auto sit = op_offload_staged_bits.find(input->name);
+                        if (sit != op_offload_staged_bits.end()) {
+                            predicted_bits = &sit->second;
+                            staged_commit = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_NOCOMMIT") == nullptr &&
+                                            split_backend->iface.offload_commit(split_backend, input_cpy);
+                            if (!staged_commit && split_backend->iface.offload_cancel != NULL) {
+                                // arrived before staging finished: release the slot so the worker is not blocked
+                                split_backend->iface.offload_cancel(split_backend, input_cpy);
+                            }
+                        }
+                    }
+                    const bool staged_noskip = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_NOSKIP") != nullptr;
+                    auto staged_covers = [&](int32_t first_id, int32_t last_id) -> bool {
+                        if (staged_noskip || !staged_commit || predicted_bits == nullptr) {
+                            return false;
+                        }
+                        const ggml_bitset_t * pb = (const ggml_bitset_t *) predicted_bits->data();
+                        for (int32_t i = first_id; i <= last_id; i++) {
+                            if (!ggml_bitset_get(pb, i)) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    };
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        if (staged_covers(first_id, last_id)) {
+                            if (op_offload_prefetch_dbg) {
+                                static int covered = 0;
+                                fprintf(stderr, "PREFETCHDBG: staged covered group [%d..%d] (%d total)\n", first_id, last_id, ++covered);
+                            }
+                            if (getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_VERIFY")) {
+                                const size_t voff = (size_t)first_id * expert_size;
+                                const size_t vlen = (size_t)(last_id - first_id + 1) * expert_size;
+                                static std::vector<char> vbuf;
+                                vbuf.resize(vlen);
+                                ggml_backend_synchronize(split_backend);
+                                ggml_backend_tensor_get_async(split_backend, input_cpy, vbuf.data(), voff, vlen);
+                                ggml_backend_synchronize(split_backend);
+                                if (memcmp(vbuf.data(), (const char *)input->data + voff, vlen) != 0) {
+                                    size_t fd = 0;
+                                    while (fd < vlen && vbuf[fd] == ((const char *)input->data + voff)[fd]) fd++;
+                                    fprintf(stderr, "VERIFY: input_cpy %s group [%d..%d] WRONG firstdiff@%zu\n",
+                                            input->name, first_id, last_id, fd);
+                                }
+                            }
+                            return;
+                        }
+                        if (op_offload_prefetch_dbg) {
+                            static int missed = 0;
+                            fprintf(stderr, "PREFETCHDBG: staged MISS group [%d..%d] (%d total)\n", first_id, last_id, ++missed);
+                        }
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        // staged mode keeps the DMA stream worker-owned: missed groups go through
+                        // the stock compute-stream copy (the shared-stream fallback races with
+                        // the worker's staging transfers)
                         if (op_offload_dma && split_backend->iface.offload_dma_copy != NULL) {
                             split_backend->iface.offload_dma_copy(split_backend, input_cpy,
                                 (const uint8_t *)input->data + expert_offset, expert_offset,

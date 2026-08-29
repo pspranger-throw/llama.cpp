@@ -152,6 +152,17 @@ extern "C" {
         // ordering the compute stream after it. Both return false if unsupported.
         bool (*offload_dma_copy) (ggml_backend_t backend, struct ggml_tensor * dst, const void * src_host, size_t offset, size_t size);
         bool (*offload_readback) (ggml_backend_t backend, const struct ggml_tensor * src, void * dst_host, size_t offset, size_t size);
+
+        // (optional) op-offload staged transfer: a worker thread stages the used-expert ranges of a
+        // host tensor (bitset in the MUL_MAT_ID layout) into pinned memory and drains them into a
+        // device ring on the DMA stream; offload_commit moves the staged ranges into the destination
+        // tensor on the compute stream (the caller must have ordered that stream after its input-copy
+        // reuse point first). offload_pass_begin drops the previous pass's state.
+        bool (*offload_prefetch_set) (ggml_backend_t backend, struct ggml_tensor * dst, const void * src_host, const uint8_t * used_bits, size_t used_bits_nbytes);
+        void (*offload_pass_begin) (ggml_backend_t backend);
+        // release a prefetch that arrived too late: the staged slot is freed and the worker
+        // drops the task if it has not published yet; the caller then uses the regular copy path
+        void (*offload_cancel) (ggml_backend_t backend, const struct ggml_tensor * dst);
     };
 
     struct ggml_backend {

@@ -8,6 +8,10 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <thread>
 
 #if defined(GGML_USE_HIP)
 #define GGML_COMMON_DECL_HIP
@@ -29,6 +33,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1412,6 +1417,21 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// op-offload staged transfer: range lists passed between scheduler, staging worker and commit
+struct ggml_cuda_staged_range { size_t offset; size_t len; };
+struct ggml_cuda_staged_task {
+    const ggml_tensor * tensor;
+    const void * src_host;
+    std::vector<ggml_cuda_staged_range> ranges;
+    uint64_t epoch;
+};
+struct ggml_cuda_staged_ready {
+    int slot;
+    const void * src_host = nullptr;
+    std::vector<ggml_cuda_staged_range> ranges;
+    std::vector<cudaEvent_t> range_events;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1487,7 +1507,7 @@ struct ggml_backend_cuda_context {
         char * dev_mem = nullptr;
         size_t total_bytes = 0;
         size_t slot_bytes = 0;
-        int n_slots = 2;
+        int n_slots = 6;
         size_t chunk_bytes = size_t(8) << 20;
         cudaStream_t dma_stream = nullptr;
         struct slot_state {
@@ -1502,6 +1522,20 @@ struct ggml_backend_cuda_context {
         cudaEvent_t readback_event = nullptr;
         void * readback_pinned = nullptr;
         size_t readback_pinned_size = 0;
+        // staged-transfer mode: worker thread fills pinned slots, DMA drains them
+        char * pinned_mem = nullptr;
+        std::vector<cudaEvent_t> slot_dma_events;  // last DMA issued per slot
+        std::vector<bool> slot_occupied;           // staged data awaiting its commit
+        std::unordered_set<const void *> canceled; // commits that arrived before staging
+        std::thread worker;
+        std::mutex mtx;
+        std::condition_variable cv_work;
+        std::condition_variable cv_ready;          // commit waits for a specific tensor here
+        std::vector<ggml_cuda_staged_task> queue;
+        std::unordered_map<const void *, ggml_cuda_staged_ready> ready;
+        std::atomic<bool> stop_worker{false};
+        uint64_t pass_epoch = 0;
+        bool worker_failed = false;
     } offload_prefetch;
 
     ~ggml_backend_cuda_context();
