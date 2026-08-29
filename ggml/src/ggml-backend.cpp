@@ -1788,6 +1788,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
+                        // dump the used-expert set for offline prediction-accuracy analysis
+                        if (const char * dump_path = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_DUMP")) {
+                            static FILE * dump_file = fopen(dump_path, "a");
+                            if (dump_file) {
+                                static int dump_rec = 0;
+                                fprintf(dump_file, "rec %d name %s n_expert %d ids_ne0 %d ids_ne1 %d bits",
+                                    dump_rec++, input->name, (int)n_expert,
+                                    (int)ids_tensor->ne[0], (int)ids_tensor->ne[1]);
+                                for (size_t w = 0; w < used_ids.size(); w++) {
+                                    fprintf(dump_file, " %08x", (unsigned)used_ids[w]);
+                                }
+                                fprintf(dump_file, "\n");
+                                fflush(dump_file);
+                            }
+                        }
+
                         prev_ids_tensor = ids_tensor;
                     }
 
