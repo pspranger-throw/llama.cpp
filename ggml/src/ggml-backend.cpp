@@ -1610,6 +1610,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // each split's commit moves the landed ranges into its input tensors; modes 1-3 were
     // measured losers and live in the branch history
     const bool op_offload_staged = !sched->callback_eval && op_offload_mode == 4;
+    // token-count gate: below this ubatch size the pass skips staging entirely and takes
+    // the stock copy path — full-set staging is a net loss at low used-expert density
+    // (measured break-even ~1400-1800 tokens depending on content, 2026-08-29 sweep);
+    // default 2048 clears both measured content families, 0 disables the gate
+    const char * op_offload_min_tok_env = getenv("GGML_CUDA_OP_OFFLOAD_PREFETCH_MIN_TOKENS");
+    const int64_t op_offload_min_tokens = op_offload_min_tok_env ? atoll(op_offload_min_tok_env) : 2048;
     if (op_offload_env && op_offload_mode != 0 && !op_offload_staged) {
         static bool warned = false;
         if (!warned) {
@@ -1631,6 +1637,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (op_offload_staged) {
+        static bool pref_cfg_logged = false;
+        if (!pref_cfg_logged) {
+            pref_cfg_logged = true;
+            fprintf(stderr, "%s: staged transfer (mode 4) active, min_tokens=%lld (GGML_CUDA_OP_OFFLOAD_PREFETCH_MIN_TOKENS, 0 disables)\n",
+                    __func__, (long long)op_offload_min_tokens);
+        }
         for (int b = 0; b < sched->n_backends; b++) {
             if (sched->backends[b]->iface.offload_pass_begin != NULL) {
                 sched->backends[b]->iface.offload_pass_begin(sched->backends[b]);
@@ -1649,6 +1661,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 continue;
             }
             struct ggml_tensor * nnode = ns->graph.nodes[0];
+            // gated pass: same batch measure as the CUDA offload routing (MUL_MAT_ID ne[2]
+            // = n_tokens); skipping the issue leaves the stock ids-readback copy path
+            if (nnode->ne[2] < op_offload_min_tokens) {
+                continue;
+            }
             for (int ii = 0; ii < ns->n_inputs; ii++) {
                 struct ggml_tensor * ninp = ns->inputs[ii];
                 if (ninp->buffer == NULL ||
