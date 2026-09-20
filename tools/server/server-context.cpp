@@ -1534,7 +1534,7 @@ private:
                             uint32_t magic = 0, version = 0;
                             f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
                             f.read(reinterpret_cast<char*>(&version), sizeof(version));
-                            if (!f.good() || magic != 0x544F4B31 || version != 1) {
+                            if (!f.good() || magic != 0x544F4B31 || version < 1 || version > 2) {
                                 SRV_WRN("slot %d: invalid or outdated .tok format, skipping\n", slot.id);
                             } else {
                                 uint32_t n_tok = 0;
@@ -1547,11 +1547,25 @@ private:
                                     if (!f.good()) {
                                         SRV_WRN("slot %d: truncated .tok file, skipping\n", slot.id);
                                     } else {
-                                        slot.prompt.tokens.clear();
-                                        slot.prompt.tokens.insert(tokens);
-                                        slot.kv_restored = true;
-                                        slot_loaded = true;
-                                        SRV_INF("slot %d: restored %u tokens\n", slot.id, n_tok);
+                                        // v1 files hold plain token arrays (text-only saves);
+                                        // v2 files hold server_tokens::serialize() output which
+                                        // round-trips media chunks as sha256-id placeholders.
+                                        // deserialize() itself discriminates the two payloads.
+                                        try {
+                                            server_tokens restored = server_tokens::deserialize(tokens, mctx != nullptr);
+                                            if (restored.size() > (size_t) slot.n_ctx) {
+                                                throw std::runtime_error("restored prompt does not fit in slot context");
+                                            }
+                                            if (!restored.validate(ctx_tgt)) {
+                                                throw std::runtime_error("invalid tokens in slot save file");
+                                            }
+                                            slot.prompt.tokens = std::move(restored);
+                                            slot.kv_restored = true;
+                                            slot_loaded = true;
+                                            SRV_INF("slot %d: restored %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                                        } catch (const std::exception & err) {
+                                            SRV_WRN("slot %d: cannot parse .tok payload (%s), skipping\n", slot.id, err.what());
+                                        }
                                     }
                                 }
                             }
@@ -3018,26 +3032,6 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    // multimodal token state cannot be round-tripped yet, skip the whole save
-                    bool any_mtmd = false;
-                    for (const auto & slot : slots) {
-                        any_mtmd |= slot.prompt.tokens.has_mtmd;
-                    }
-                    if (any_mtmd) {
-                        SRV_WRN("%s", "save-session skipped: multimodal input present, session state cannot be restored\n");
-                        auto res = std::make_unique<server_task_result_slot_save_load>();
-                        res->id       = task.id;
-                        res->id_slot  = -1;
-                        res->filename = filename;
-                        res->is_save  = true;
-                        res->skipped  = true;
-                        res->n_tokens = 0;
-                        res->n_bytes  = 0;
-                        res->t_ms     = 0.0;
-                        queue_results.send(std::move(res));
-                        break;
-                    }
-
                     // remove any stale marker first: a crash mid-save must leave no valid save set
                     session_remove_quiet(params_base.slot_save_path + SESSION_MARKER_NAME);
 
@@ -3082,13 +3076,17 @@ private:
                             std::string tok_path = params_base.slot_save_path + "slot_" + std::to_string(slot.id) + ".tok";
                             std::ofstream f(tok_path, std::ios::binary);
                             const uint32_t magic   = 0x544F4B31;
-                            const uint32_t version = 1;
+                            // v2: payload is server_tokens::serialize() output (packed tokens + media chunks)
+                            // v1: payload was a plain llama_tokens array (text-only, no media map)
+                            const uint32_t version = 2;
                             f.write(reinterpret_cast<const char*>(&magic),   sizeof(magic));
                             f.write(reinterpret_cast<const char*>(&version), sizeof(version));
-                            uint32_t n_tokens = (uint32_t) slot.prompt.tokens.size();
-                            f.write(reinterpret_cast<const char*>(&n_tokens), sizeof(n_tokens));
-                            auto raw_tokens = slot.prompt.tokens.get_tokens();
-                            f.write(reinterpret_cast<const char*>(raw_tokens.data()), n_tokens * sizeof(llama_token));
+                            // the reported token count stays the logical prompt size, incl. media positions
+                            const uint32_t n_tokens = (uint32_t) slot.prompt.tokens.size();
+                            const auto packed = slot.prompt.tokens.serialize();
+                            const uint32_t n_words = (uint32_t) (packed.size() / sizeof(llama_token));
+                            f.write(reinterpret_cast<const char*>(&n_words), sizeof(n_words));
+                            f.write(packed.data(), packed.size());
                             f.close();
                             written.push_back(tok_path);
 
