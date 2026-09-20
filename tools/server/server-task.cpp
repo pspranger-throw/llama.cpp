@@ -1624,6 +1624,7 @@ json server_task_result_slot_save_load::to_json() {
         return json {
             { "id_slot",   id_slot },
             { "filename",  filename },
+            { "skipped",   skipped },
             { "n_saved",   n_tokens },
             { "n_written", n_bytes },
             { "timings", {
