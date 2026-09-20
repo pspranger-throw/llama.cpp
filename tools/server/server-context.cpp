@@ -17,6 +17,10 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+// vendored xxHash, inlined into this TU (no new link dependencies)
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -118,14 +122,22 @@ struct session_marker_entry {
     uint64_t    hash;
 };
 
-// FNV-1a 64 over the file contents, plus the file size
+// XXH3-64 over the file contents, plus the file size (marker v2; v1 was FNV-1a)
 static bool session_file_digest(const std::string & path, uint64_t & size_out, uint64_t & hash_out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         return false;
     }
 
-    uint64_t hash = 14695981039346656037ull; // FNV-1a 64 offset basis
+    XXH3_state_t * state = XXH3_createState();
+    if (state == nullptr) {
+        return false;
+    }
+    if (XXH3_64bits_reset(state) == XXH_ERROR) {
+        XXH3_freeState(state);
+        return false;
+    }
+
     uint64_t size = 0;
 
     char buf[64 * 1024];
@@ -136,18 +148,21 @@ static bool session_file_digest(const std::string & path, uint64_t & size_out, u
             break;
         }
         size += (uint64_t) n;
-        for (std::streamsize i = 0; i < n; ++i) {
-            hash ^= (unsigned char) buf[i];
-            hash *= 1099511628211ull; // FNV-1a 64 prime
+        if (XXH3_64bits_update(state, buf, (size_t) n) == XXH_ERROR) {
+            XXH3_freeState(state);
+            return false;
         }
     }
+
+    const XXH64_hash_t hash = XXH3_64bits_digest(state);
+    XXH3_freeState(state);
 
     if (f.bad()) {
         return false;
     }
 
     size_out = size;
-    hash_out = hash;
+    hash_out = (uint64_t) hash;
     return true;
 }
 
@@ -160,7 +175,7 @@ static bool session_marker_write(const std::string & dir, const std::vector<sess
     }
 
     const uint32_t magic   = 0x534D524B; // "SMRK"
-    const uint32_t version = 1;
+    const uint32_t version = 2; // v2 = XXH3-64 digests (v1 = FNV-1a, rejected)
 
     f.write(reinterpret_cast<const char *>(&magic),   sizeof(magic));
     f.write(reinterpret_cast<const char *>(&version), sizeof(version));
@@ -215,7 +230,7 @@ static bool session_marker_read(const std::string & dir, std::vector<session_mar
     f.read(reinterpret_cast<char *>(&version), sizeof(version));
     f.read(reinterpret_cast<char *>(&n_files), sizeof(n_files));
 
-    if (!f.good() || magic != 0x534D524B || version != 1) {
+    if (!f.good() || magic != 0x534D524B || version != 2) {
         err = "invalid or outdated marker format";
         return false;
     }
