@@ -1967,17 +1967,22 @@ private:
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
-            // restored slots already hold exact KV state, prompt cache round-trip would corrupt it
-            update_cache = update_cache && !ret->kv_restored;
-
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
+                // stash the outgoing context first — for a disk-restored slot this
+                // publishes the exact restored state into the RAM prompt cache so
+                // a later request for that session can be re-materialized from it
+                // (multi-session-per-slot semantics survive a restore). the load
+                // half stays skipped for restored slots: their in-slot state is
+                // exact (KV + checkpoints + spec state) and a cache round-trip
+                // would replace it with a lossier copy — the normal prompt-diff
+                // path continues or diverges from the in-slot state directly.
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (!ret->kv_restored && !ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 
