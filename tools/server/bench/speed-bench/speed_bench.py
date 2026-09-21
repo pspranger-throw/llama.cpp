@@ -160,24 +160,63 @@ def run_request(
     osl: int,
     extra_inputs: dict[str, Any],
     timeout: float,
+    api_key: str | None = None,
+    stream: bool = False,
 ) -> tuple[dict[str, Any], float]:
     payload: dict[str, Any] = {
         "messages": messages,
         "max_tokens": osl,
-        "stream": False,
+        "stream": stream,
     }
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
     if model:
         payload["model"] = model
     payload.update(extra_inputs)
     payload["max_tokens"] = osl
 
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     start = time.perf_counter()
-    response = requests.post(endpoint, json=payload, timeout=timeout)
-    latency_s = time.perf_counter() - start
+    response = requests.post(endpoint, json=payload, timeout=timeout, headers=headers)
     if response.status_code != 200:
+        latency_s = time.perf_counter() - start
         body = response.text[:500].replace("\n", "\\n")
         raise RuntimeError(f"HTTP {response.status_code}: {body}")
-    return response.json(), latency_s
+    if not stream:
+        latency_s = time.perf_counter() - start
+        return response.json(), latency_s
+
+    # Streaming path: reassemble SSE into the non-streaming response shape.
+    # TabbyAPI only reports token counts/timings in the streamed usage chunk.
+    content_parts: list[str] = []
+    finish_reason: str | None = None
+    usage: dict[str, Any] = {}
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line or not raw_line.startswith("data: "):
+            continue
+        data_str = raw_line[len("data: "):]
+        if data_str.strip() == "[DONE]":
+            break
+        try:
+            event = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        u = event.get("usage")
+        if isinstance(u, dict) and u:
+            usage = u
+        choices = event.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            choice = choices[0]
+            if choice.get("finish_reason"):
+                finish_reason = choice.get("finish_reason")
+            delta = choice.get("delta") or {}
+            if isinstance(delta.get("content"), str):
+                content_parts.append(delta["content"])
+    latency_s = time.perf_counter() - start
+    return {
+        "choices": [{"finish_reason": finish_reason, "message": {"content": "".join(content_parts)}}],
+        "usage": usage,
+    }, latency_s
 
 
 def run_one(
@@ -187,6 +226,8 @@ def run_one(
     osl: int,
     extra_inputs: dict[str, Any],
     timeout: float,
+    api_key: str | None = None,
+    stream: bool = False,
 ) -> RequestResult:
     selected_turns = sample.turns
     messages: list[dict[str, str]] = []
@@ -204,7 +245,7 @@ def run_one(
     try:
         for turn in selected_turns:
             messages.append({"role": "user", "content": turn})
-            data, latency_s = run_request(endpoint, model, messages, osl, extra_inputs, timeout)
+            data, latency_s = run_request(endpoint, model, messages, osl, extra_inputs, timeout, api_key, stream)
             total_latency_s += latency_s
             usage, timings, finish_reason, assistant_text = parse_completion_response(data)
 
@@ -214,14 +255,37 @@ def run_one(
             prompt_tokens += turn_prompt_tokens
             completion_tokens += turn_completion_tokens_count
             total_tokens += turn_total_tokens_count
-            draft_n += int(timings.get("draft_n") or 0)
-            draft_n_accepted += int(timings.get("draft_n_accepted") or 0)
-            prompt_ms += float(timings.get("prompt_ms") or 0)
-            predicted_ms += float(timings.get("predicted_ms") or 0)
-            if len(selected_turns) == 1 and isinstance(timings.get("prompt_per_second"), (int, float)):
-                prompt_per_second = float(timings["prompt_per_second"])
-            if len(selected_turns) == 1 and isinstance(timings.get("predicted_per_second"), (int, float)):
-                predicted_per_second = float(timings["predicted_per_second"])
+            # Timings: server `timings` block first; TabbyAPI usage-extension fallback
+            # (prompt_time/completion_time in seconds) when the block is absent.
+            turn_prompt_ms = float(timings.get("prompt_ms") or 0)
+            turn_predicted_ms = float(timings.get("predicted_ms") or 0)
+            if not turn_prompt_ms and usage.get("prompt_time") is not None:
+                turn_prompt_ms = float(usage["prompt_time"]) * 1000.0
+                turn_predicted_ms = float(usage.get("completion_time") or 0) * 1000.0
+            prompt_ms += turn_prompt_ms
+            predicted_ms += turn_predicted_ms
+            # Spec-decode acceptance: llama.cpp timings draft_n/draft_n_accepted, or
+            # TabbyAPI usage completion_tokens_details accepted/rejected prediction tokens.
+            details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+            if isinstance(details, dict) and (details.get("accepted_prediction_tokens") or details.get("rejected_prediction_tokens")):
+                acc = int(details.get("accepted_prediction_tokens") or 0)
+                rej = int(details.get("rejected_prediction_tokens") or 0)
+                draft_n += acc + rej
+                draft_n_accepted += acc
+            else:
+                draft_n += int(timings.get("draft_n") or 0)
+                draft_n_accepted += int(timings.get("draft_n_accepted") or 0)
+            if len(selected_turns) == 1:
+                pps = timings.get("prompt_per_second")
+                if not isinstance(pps, (int, float)):
+                    pps = usage.get("prompt_tokens_per_sec")
+                if isinstance(pps, (int, float)):
+                    prompt_per_second = float(pps)
+                tps = timings.get("predicted_per_second")
+                if not isinstance(tps, (int, float)):
+                    tps = usage.get("completion_tokens_per_sec")
+                if isinstance(tps, (int, float)):
+                    predicted_per_second = float(tps)
 
             messages.append({"role": "assistant", "content": assistant_text})
 
@@ -378,6 +442,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--concurrency", type=int, default=1, help="Concurrent client requests; usually match llama-server --np")
     parser.add_argument("--limit", type=int, default=None, help="Optional sample limit per category for smoke tests")
     parser.add_argument("--timeout", type=float, default=600, help="Per-request timeout in seconds")
+    parser.add_argument("--api-key", default=None, help="Optional Bearer API key for the server (e.g. TabbyAPI)")
+    parser.add_argument("--stream", action="store_true", help="Stream responses (needed for TabbyAPI usage/timings)")
     parser.add_argument("--output", default=None, help="Optional path to save raw results JSON")
     args = parser.parse_args(argv)
     try:
@@ -396,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = [
-            executor.submit(run_one, sample, endpoint, args.model, args.osl, extra_inputs, args.timeout)
+            executor.submit(run_one, sample, endpoint, args.model, args.osl, extra_inputs, args.timeout, args.api_key, args.stream)
             for sample in samples
         ]
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="speed_bench", unit="sample"):
