@@ -546,3 +546,143 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert res.body["content"] == content
+
+
+#
+# Full-session persistence (_startup_session.bin save set).
+#
+
+# optional local model fixture, avoids the default HF download
+SESSION_MODEL_FILE = os.environ.get("T1_MODEL_FILE")
+
+def test_save_session_rejects_non_canonical_filename():
+    global server
+    if SESSION_MODEL_FILE:
+        server.model_file = SESSION_MODEL_FILE
+    server.n_predict = 8
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog.",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    # the startup loader reads only the canonical name, so any other name
+    # would write an orphan state file
+    res = server.make_request("POST", "/save-session", data={
+        "filename": "session_copy.bin",
+    })
+    assert res.status_code == 400
+    assert "error" in res.body
+    assert not os.path.exists(os.path.join(server.slot_save_path, "session_copy.bin"))
+
+    # malformed input must fail as 400, never 500: the production supervisor
+    # treats 5xx from this endpoint as a failed write and deletes the save set
+    res = server.make_request("POST", "/save-session", data={"no_filename": 1})
+    assert res.status_code == 400
+    res = server.make_request("POST", "/save-session", data="not an object")
+    assert res.status_code == 400
+
+    # the canonical name must keep working
+    res = server.make_request("POST", "/save-session", data={
+        "filename": "_startup_session.bin",
+    })
+    assert res.status_code == 200
+    server.stop()
+
+def test_session_save_restore_across_restart():
+    global server
+    if SESSION_MODEL_FILE:
+        server.model_file = SESSION_MODEL_FILE
+    server.n_predict = 8
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog.",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    prompt_n_full = res.body["timings"]["prompt_n"]
+    assert prompt_n_full > 0
+    content = res.body["content"]
+
+    # save the full session (state file + per-slot tokens + commit marker)
+    res = server.make_request("POST", "/save-session", data={
+        "filename": "_startup_session.bin",
+    })
+    assert res.status_code == 200
+    assert os.path.exists(os.path.join(server.slot_save_path, "_startup_session.bin"))
+    assert os.path.exists(os.path.join(server.slot_save_path, "_startup_session.marker"))
+    assert os.path.exists(os.path.join(server.slot_save_path, "slot_0.tok"))
+
+    # crash: SIGKILL, no graceful shutdown
+    server.process.kill()
+    server.process.wait()
+    server.process = None
+
+    # restart with the same --slot-save-path: the validated save set must restore.
+    # the restored slot prompt includes the generated tokens, so the continuation
+    # must extend the saved history (prompt + first response), as a real session
+    # turn would - a shorter prompt is a designed checkpoint-or-reset, not reuse
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog." + content,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] >= prompt_n_full - 2  # near-full restore
+    assert res.body["timings"]["prompt_n"] <= 4
+    server.stop()
+
+
+def test_torn_session_set_cold_start():
+    global server
+    if SESSION_MODEL_FILE:
+        server.model_file = SESSION_MODEL_FILE
+    server.n_predict = 8
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog.",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    prompt_n_full = res.body["timings"]["prompt_n"]
+    assert prompt_n_full > 0
+
+    res = server.make_request("POST", "/save-session", data={
+        "filename": "_startup_session.bin",
+    })
+    assert res.status_code == 200
+
+    # crash: SIGKILL before corrupting the save set
+    server.process.kill()
+    server.process.wait()
+    server.process = None
+
+    # torn set: truncate the state file, keep the valid marker (size/hash mismatch)
+    path = os.path.join(server.slot_save_path, "_startup_session.bin")
+    with open(path, "rb") as f:
+        data = f.read()
+    assert len(data) > 0
+    with open(path, "wb") as f:
+        f.write(data[:len(data) // 2])
+
+    # restart must survive: cold start, the same prompt is fully reprocessed
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog.",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] == 0
+    assert res.body["timings"]["prompt_n"] == prompt_n_full
+    server.stop()

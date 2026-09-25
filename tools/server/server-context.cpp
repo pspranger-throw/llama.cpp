@@ -115,6 +115,7 @@ static std::vector<llama_token> server_sample_and_accept_synth(
 // ---------------------------------------------------------------------------
 
 static const char * SESSION_MARKER_NAME = "_startup_session.marker";
+static const char * SESSION_STATE_NAME  = "_startup_session.bin";
 
 struct session_marker_entry {
     std::string name;
@@ -1532,7 +1533,7 @@ private:
 
         // load full session state if present in --slot-save-path (KV persistence across restarts)
         if (!params_base.slot_save_path.empty()) {
-            std::string session_path = params_base.slot_save_path + "_startup_session.bin";
+            std::string session_path = params_base.slot_save_path + SESSION_STATE_NAME;
             if (std::filesystem::exists(session_path)) {
                 // the commit marker is the source of truth for a complete, consistent save set
                 size_t n_session_tokens = 0;
@@ -1557,16 +1558,16 @@ private:
                                 if (!f.good() || n_tok == 0 || n_tok > 10*1024*1024) {
                                     SRV_WRN("slot %d: invalid token count (%u), skipping\n", slot.id, n_tok);
                                 } else {
-                                    llama_tokens tokens(n_tok);
-                                    f.read(reinterpret_cast<char*>(tokens.data()), n_tok * sizeof(llama_token));
-                                    if (!f.good()) {
-                                        SRV_WRN("slot %d: truncated .tok file, skipping\n", slot.id);
-                                    } else {
-                                        // v1 files hold plain token arrays (text-only saves);
-                                        // v2 files hold server_tokens::serialize() output which
-                                        // round-trips media chunks as sha256-id placeholders.
-                                        // deserialize() itself discriminates the two payloads.
-                                        try {
+                                    try {
+                                        llama_tokens tokens(n_tok);
+                                        f.read(reinterpret_cast<char*>(tokens.data()), n_tok * sizeof(llama_token));
+                                        if (!f.good()) {
+                                            SRV_WRN("slot %d: truncated .tok file, skipping\n", slot.id);
+                                        } else {
+                                            // v1 files hold plain token arrays (text-only saves);
+                                            // v2 files hold server_tokens::serialize() output which
+                                            // round-trips media chunks as sha256-id placeholders.
+                                            // deserialize() itself discriminates the two payloads.
                                             server_tokens restored = server_tokens::deserialize(tokens, mctx != nullptr);
                                             if (restored.size() > (size_t) slot.n_ctx) {
                                                 throw std::runtime_error("restored prompt does not fit in slot context");
@@ -1578,9 +1579,9 @@ private:
                                             slot.kv_restored = true;
                                             slot_loaded = true;
                                             SRV_INF("slot %d: restored %zu tokens\n", slot.id, slot.prompt.tokens.size());
-                                        } catch (const std::exception & err) {
-                                            SRV_WRN("slot %d: cannot parse .tok payload (%s), skipping\n", slot.id, err.what());
                                         }
+                                    } catch (const std::exception & err) {
+                                        SRV_WRN("slot %d: cannot parse .tok payload (%s), skipping\n", slot.id, err.what());
                                     }
                                 }
                             }
@@ -1596,51 +1597,63 @@ private:
                             if (!f.good() || magic != 0x434B5054 || version != 1) {
                                 SRV_WRN("slot %d: invalid or outdated .ckpt format, skipping\n", slot.id);
                             } else {
-                                uint32_t n_ckpts = 0;
-                                f.read(reinterpret_cast<char*>(&n_ckpts), sizeof(n_ckpts));
-                                if (!f.good() || n_ckpts > 1000) {
-                                    SRV_WRN("slot %d: invalid checkpoint count (%u), skipping\n", slot.id, n_ckpts);
-                                } else {
-                                    size_t total_ckpt_bytes = 0;
-                                    bool ckpt_ok = true;
-                                    for (uint32_t i = 0; i < n_ckpts && ckpt_ok; ++i) {
-                                        auto & ckpt = slot.prompt.checkpoints.emplace_back();
-
-                                        f.read(reinterpret_cast<char*>(&ckpt.n_tokens), sizeof(ckpt.n_tokens));
-                                        f.read(reinterpret_cast<char*>(&ckpt.pos_min),  sizeof(ckpt.pos_min));
-                                        f.read(reinterpret_cast<char*>(&ckpt.pos_max),  sizeof(ckpt.pos_max));
-                                        if (!f.good()) { ckpt_ok = false; break; }
-
-                                        uint64_t sz;
-                                        f.read(reinterpret_cast<char*>(&sz), sizeof(sz));
-                                        if (!f.good() || sz > 10ull*1024*1024*1024) { ckpt_ok = false; break; }
-                                        ckpt.data_tgt.resize(sz);
-                                        f.read(reinterpret_cast<char*>(ckpt.data_tgt.data()), sz);
-                                        total_ckpt_bytes += sz;
-                                        if (!f.good()) { ckpt_ok = false; break; }
-
-                                        f.read(reinterpret_cast<char*>(&sz), sizeof(sz));
-                                        if (!f.good() || sz > 10ull*1024*1024*1024) { ckpt_ok = false; break; }
-                                        ckpt.data_dft.resize(sz);
-                                        f.read(reinterpret_cast<char*>(ckpt.data_dft.data()), sz);
-                                        total_ckpt_bytes += sz;
-                                        if (!f.good()) { ckpt_ok = false; break; }
-
-                                        f.read(reinterpret_cast<char*>(&sz), sizeof(sz));
-                                        if (!f.good() || sz > 10ull*1024*1024*1024) { ckpt_ok = false; break; }
-                                        ckpt.data_spec.resize(sz);
-                                        f.read(reinterpret_cast<char*>(ckpt.data_spec.data()), sz);
-                                        total_ckpt_bytes += sz;
-                                        if (!f.good()) { ckpt_ok = false; break; }
-                                    }
-                                    if (!ckpt_ok) {
-                                        SRV_WRN("slot %d: truncated .ckpt file, discarding %zu checkpoints\n",
-                                                slot.id, slot.prompt.checkpoints.size());
-                                        slot.prompt.checkpoints.clear();
+                                try {
+                                    // bound every blob size by the bytes actually left in the file:
+                                    // a corrupt size field must fail the read, never drive a huge resize
+                                    const auto ckpt_hdr_pos = f.tellg();
+                                    f.seekg(0, std::ios::end);
+                                    const auto ckpt_file_size = (uint64_t) f.tellg();
+                                    f.seekg(ckpt_hdr_pos);
+                                    uint32_t n_ckpts = 0;
+                                    f.read(reinterpret_cast<char*>(&n_ckpts), sizeof(n_ckpts));
+                                    if (!f.good() || n_ckpts > 1000) {
+                                        SRV_WRN("slot %d: invalid checkpoint count (%u), skipping\n", slot.id, n_ckpts);
                                     } else {
-                                        SRV_INF("slot %d: restored %u checkpoints (%.1f MiB)\n",
-                                                slot.id, n_ckpts, (float) total_ckpt_bytes / 1024 / 1024);
+                                        size_t total_ckpt_bytes = 0;
+                                        bool ckpt_ok = true;
+                                        for (uint32_t i = 0; i < n_ckpts && ckpt_ok; ++i) {
+                                            auto & ckpt = slot.prompt.checkpoints.emplace_back();
+
+                                            f.read(reinterpret_cast<char*>(&ckpt.n_tokens), sizeof(ckpt.n_tokens));
+                                            f.read(reinterpret_cast<char*>(&ckpt.pos_min),  sizeof(ckpt.pos_min));
+                                            f.read(reinterpret_cast<char*>(&ckpt.pos_max),  sizeof(ckpt.pos_max));
+                                            if (!f.good()) { ckpt_ok = false; break; }
+
+                                            uint64_t sz;
+                                            f.read(reinterpret_cast<char*>(&sz), sizeof(sz));
+                                            if (!f.good() || sz > 10ull*1024*1024*1024 || sz > ckpt_file_size - (uint64_t) f.tellg()) { ckpt_ok = false; break; }
+                                            ckpt.data_tgt.resize(sz);
+                                            f.read(reinterpret_cast<char*>(ckpt.data_tgt.data()), sz);
+                                            total_ckpt_bytes += sz;
+                                            if (!f.good()) { ckpt_ok = false; break; }
+
+                                            f.read(reinterpret_cast<char*>(&sz), sizeof(sz));
+                                            if (!f.good() || sz > 10ull*1024*1024*1024 || sz > ckpt_file_size - (uint64_t) f.tellg()) { ckpt_ok = false; break; }
+                                            ckpt.data_dft.resize(sz);
+                                            f.read(reinterpret_cast<char*>(ckpt.data_dft.data()), sz);
+                                            total_ckpt_bytes += sz;
+                                            if (!f.good()) { ckpt_ok = false; break; }
+
+                                            f.read(reinterpret_cast<char*>(&sz), sizeof(sz));
+                                            if (!f.good() || sz > 10ull*1024*1024*1024 || sz > ckpt_file_size - (uint64_t) f.tellg()) { ckpt_ok = false; break; }
+                                            ckpt.data_spec.resize(sz);
+                                            f.read(reinterpret_cast<char*>(ckpt.data_spec.data()), sz);
+                                            total_ckpt_bytes += sz;
+                                            if (!f.good()) { ckpt_ok = false; break; }
+                                        }
+                                        if (!ckpt_ok) {
+                                            SRV_WRN("slot %d: truncated .ckpt file, discarding %zu checkpoints\n",
+                                                    slot.id, slot.prompt.checkpoints.size());
+                                            slot.prompt.checkpoints.clear();
+                                        } else {
+                                            SRV_INF("slot %d: restored %u checkpoints (%.1f MiB)\n",
+                                                    slot.id, n_ckpts, (float) total_ckpt_bytes / 1024 / 1024);
+                                        }
                                     }
+                                } catch (const std::exception & err) {
+                                    SRV_WRN("slot %d: cannot parse .ckpt payload (%s), discarding %zu checkpoints\n",
+                                            slot.id, err.what(), slot.prompt.checkpoints.size());
+                                    slot.prompt.checkpoints.clear();
                                 }
                             }
                         }
@@ -3076,7 +3089,7 @@ private:
                     std::vector<session_marker_entry> entries;
                     {
                         session_marker_entry e;
-                        e.name = "_startup_session.bin";
+                        e.name = SESSION_STATE_NAME;
                         if (!session_file_digest(filepath, e.size, e.hash)) {
                             fail_definitive("state file digest failed");
                             break;
@@ -5821,10 +5834,22 @@ void server_routes::init_routes() {
 
 std::unique_ptr<server_res_generator> server_routes::handle_save_session(const server_http_req & req) {
     auto res = create_response();
-    const json request_data = json::parse(req.body);
-    std::string filename = request_data.at("filename");
+    std::string filename;
+    try {
+        const json request_data = json::parse(req.body);
+        filename = request_data.at("filename");
+    } catch (const std::exception & e) {
+        res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
     if (!fs_validate_filename(filename)) {
         res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    // the startup loader only reads the canonical name, anything else would
+    // write an orphan state file outside the committed save set
+    if (filename != SESSION_STATE_NAME) {
+        res->error(format_error_response(std::string("Invalid filename, must be \"") + SESSION_STATE_NAME + "\"", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
     std::string filepath = params.slot_save_path + filename;
