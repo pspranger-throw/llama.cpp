@@ -3,6 +3,7 @@ from utils import *
 import base64
 import requests
 import struct
+import shutil
 
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
 STATE_FILE_HEADER_SIZE = 12
@@ -685,4 +686,62 @@ def test_torn_session_set_cold_start():
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert res.body["timings"]["prompt_n"] == prompt_n_full
+    server.stop()
+
+def test_stale_slot_file_not_restored():
+    global server
+    if SESSION_MODEL_FILE:
+        server.model_file = SESSION_MODEL_FILE
+    server.n_predict = 8
+    server.start()
+
+    # fill slot 1 only: slot 0 stays empty, so the save set contains no slot_0.tok
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    prompt_n_full = res.body["timings"]["prompt_n"]
+    assert prompt_n_full > 0
+    content = res.body["content"]
+
+    res = server.make_request("POST", "/save-session", data={
+        "filename": "_startup_session.bin",
+    })
+    assert res.status_code == 200
+    assert os.path.exists(os.path.join(server.slot_save_path, "slot_1.tok"))
+    assert not os.path.exists(os.path.join(server.slot_save_path, "slot_0.tok"))
+
+    # crash: SIGKILL, no graceful shutdown
+    server.process.kill()
+    server.process.wait()
+    server.process = None
+
+    # stale artifact: a valid slot_1.tok under a name the marker does not list
+    shutil.copy(
+        os.path.join(server.slot_save_path, "slot_1.tok"),
+        os.path.join(server.slot_save_path, "slot_0.tok"),
+    )
+
+    server.start()
+
+    # the listed file still restores: near-full cache hit on slot 1
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog." + content,
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] <= 4
+
+    # the unlisted file must be ignored: slot 0 starts cold, full reprocess
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog." + content,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] == 0
+    assert res.body["timings"]["prompt_n"] >= prompt_n_full
     server.stop()

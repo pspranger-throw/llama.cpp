@@ -277,8 +277,8 @@ static bool session_marker_read(const std::string & dir, std::vector<session_mar
 }
 
 // validate the whole save set against the commit marker
-static bool session_set_validate(const std::string & dir, std::string & err) {
-    std::vector<session_marker_entry> entries;
+// on success, "entries" holds the manifest of files that belong to the set
+static bool session_set_validate(const std::string & dir, std::vector<session_marker_entry> & entries, std::string & err) {
     if (!session_marker_read(dir, entries, err)) {
         return false;
     }
@@ -553,6 +553,8 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+
+        kv_restored = false;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1538,14 +1540,24 @@ private:
                 // the commit marker is the source of truth for a complete, consistent save set
                 size_t n_session_tokens = 0;
                 std::string set_err;
-                if (!session_set_validate(params_base.slot_save_path, set_err)) {
+                std::vector<session_marker_entry> marker_entries;
+                if (!session_set_validate(params_base.slot_save_path, marker_entries, set_err)) {
                     SRV_WRN("save set failed validation (%s), starting cold\n", set_err.c_str());
                 } else if (llama_state_load_file(ctx_tgt, session_path.c_str(), nullptr, 0, &n_session_tokens)) {
                     SRV_INF("%s", "session state loaded successfully (save set validated)\n");
+                    const auto in_marker = [&marker_entries](const std::string & name) {
+                        return std::any_of(marker_entries.begin(), marker_entries.end(), [&name](const session_marker_entry & e) {
+                            return e.name == name;
+                        });
+                    };
                     for (auto & slot : slots) {
                         bool slot_loaded = false;
-                        std::string slot_path = params_base.slot_save_path + "slot_" + std::to_string(slot.id) + ".tok";
-                        if (std::filesystem::exists(slot_path)) {
+                        const std::string tok_name = "slot_" + std::to_string(slot.id) + ".tok";
+                        std::string slot_path = params_base.slot_save_path + tok_name;
+                        if (std::filesystem::exists(slot_path) && !in_marker(tok_name)) {
+                            SRV_WRN("slot %d: %s is not in the commit marker (stale file), skipping\n", slot.id, tok_name.c_str());
+                        }
+                        if (std::filesystem::exists(slot_path) && in_marker(tok_name)) {
                             std::ifstream f(slot_path, std::ios::binary);
                             uint32_t magic = 0, version = 0;
                             f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
@@ -1588,8 +1600,12 @@ private:
                         }
 
                         // load checkpoints if available
-                        std::string ckpt_path = params_base.slot_save_path + "slot_" + std::to_string(slot.id) + ".ckpt";
-                        if (std::filesystem::exists(ckpt_path) && slot_loaded) {
+                        const std::string ckpt_name = "slot_" + std::to_string(slot.id) + ".ckpt";
+                        std::string ckpt_path = params_base.slot_save_path + ckpt_name;
+                        if (std::filesystem::exists(ckpt_path) && slot_loaded && !in_marker(ckpt_name)) {
+                            SRV_WRN("slot %d: %s is not in the commit marker (stale file), skipping\n", slot.id, ckpt_name.c_str());
+                        }
+                        if (std::filesystem::exists(ckpt_path) && slot_loaded && in_marker(ckpt_name)) {
                             std::ifstream f(ckpt_path, std::ios::binary);
                             uint32_t magic = 0, version = 0;
                             f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
